@@ -13,9 +13,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# TRACE modifications (2026): causal signatures and memory, with full-method specialization.
 from dataclasses import dataclass, field
 
-import lerobot.policies  # noqa: F401
+from lerobot_policy_streaming_act.trace_config import TraceConfigMixin
+
+try:
+    from policy_imports import install_lerobot_policies_namespace_shim
+except ModuleNotFoundError:
+
+    def install_lerobot_policies_namespace_shim() -> None:
+        return None
+
+
+install_lerobot_policies_namespace_shim()
+
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
@@ -30,124 +43,16 @@ from .prefix_sequence import (
     is_prefix_image_key,
 )
 
-FIRST_FRAME_ANCHOR_KEY = "observation.anchor_image"
-
 
 @PreTrainedConfig.register_subclass("streaming_act")
 @dataclass
-class StreamingACTConfig(PreTrainedConfig):
-    """Configuration class for the Action Chunking Transformers policy.
+class StreamingACTConfig(TraceConfigMixin, PreTrainedConfig):
+    """Full TRACE with an ACT action decoder.
 
-    Defaults are configured for training on bimanual Aloha tasks like "insertion" or "transfer".
-
-    The parameters you will most likely need to change are the ones which depend on the environment / sensors.
-    Those are: `input_features` and `output_features`.
-
-    Notes on the inputs and outputs:
-        - Either:
-            - At least one key starting with "observation.image is required as an input.
-              AND/OR
-            - The key "observation.environment_state" is required as input.
-        - If there are multiple keys beginning with "observation.images." they are treated as multiple camera
-          views. Right now we only support all images having the same shape.
-        - May optionally work without an "observation.state" key for the proprioceptive robot state.
-        - "action" is required as an output key.
-
-    Args:
-        n_obs_steps: Number of environment steps worth of observations to pass to the policy (takes the
-            current step and additional steps going back).
-        chunk_size: The size of the action prediction "chunks" in units of environment steps.
-        n_action_steps: The number of action steps to run in the environment for one invocation of the policy.
-            This should be no greater than the chunk size. For example, if the chunk size size 100, you may
-            set this to 50. This would mean that the model predicts 100 steps worth of actions, runs 50 in the
-            environment, and throws the other 50 out.
-        input_features: A dictionary defining the PolicyFeature of the input data for the policy. The key represents
-            the input data name, and the value is PolicyFeature, which consists of FeatureType and shape attributes.
-        output_features: A dictionary defining the PolicyFeature of the output data for the policy. The key represents
-            the output data name, and the value is PolicyFeature, which consists of FeatureType and shape attributes.
-        normalization_mapping: A dictionary that maps from a str value of FeatureType (e.g., "STATE", "VISUAL") to
-            a corresponding NormalizationMode (e.g., NormalizationMode.MIN_MAX)
-        vision_backbone: Name of the torchvision resnet backbone to use for encoding images.
-        pretrained_backbone_weights: Pretrained weights from torchvision to initialize the backbone.
-            `None` means no pretrained weights.
-        replace_final_stride_with_dilation: Whether to replace the ResNet's final 2x2 stride with a dilated
-            convolution.
-        pre_norm: Whether to use "pre-norm" in the transformer blocks.
-        dim_model: The transformer blocks' main hidden dimension.
-        n_heads: The number of heads to use in the transformer blocks' multi-head attention.
-        dim_feedforward: The dimension to expand the transformer's hidden dimension to in the feed-forward
-            layers.
-        feedforward_activation: The activation to use in the transformer block's feed-forward layers.
-        n_encoder_layers: The number of transformer layers to use for the transformer encoder.
-        n_decoder_layers: The number of transformer layers to use for the transformer decoder.
-        use_vae: Whether to use a variational objective during training. This introduces another transformer
-            which is used as the VAE's encoder (not to be confused with the transformer encoder - see
-            documentation in the policy class).
-        latent_dim: The VAE's latent dimension.
-        n_vae_encoder_layers: The number of transformer layers to use for the VAE's encoder.
-        use_path_signature: Whether to enable path-signature-based historical context encoding for
-            streaming inference/training.
-        history_length: Number of past timesteps to include when computing path signatures.
-        signature_dim: Dimension of the computed signature feature vector. This is often determined by
-            signature channels and truncation depth; set to 0 to indicate "infer from implementation".
-        signature_depth: Truncation level used when computing the path signature.
-        signature_hidden_dim: Hidden dimension used by the projection MLP that maps high-dimensional
-            signature vectors into model-friendly embeddings.
-        signature_dropout: Dropout used in the signature projection MLP for regularization.
-        pre_normalized_observation_keys: Observation keys that are already normalized
-            upstream and should therefore skip runtime normalization in the processor fast
-            path.
-        use_first_frame_anchor: Whether to consume an episode-constant first-frame anchor image
-            from `observation.anchor_image` and inject it as one extra encoder memory token.
-        use_prefix_sequence_training: Whether to expose episode-prefix sequence tensors
-            alongside the current-step observation for future streaming prefix memory updates.
-        prefix_train_max_steps: Fixed prefix length budget used by the prefix-sequence
-            training interface. Prefix tensors are right padded to this length.
-        prefix_frame_stride: Subsampling stride used when extracting the episode prefix.
-            The current step is always kept as the last valid prefix element.
-        prefix_pad_value: Numeric padding value used for prefix state/signature tensors.
-        use_visual_prefix_memory: Whether to enable a fixed-budget visual prefix memory
-            branch that scans the prefix sequence and injects extra encoder memory tokens.
-        use_delta_signature: Whether to consume `observation.delta_signature`
-            and optionally inject it as an extra encoder memory token.
-        use_signature_conditioned_visual_prefix_memory: Whether the visual prefix
-            memory updater should explicitly condition on path signatures (and on
-            delta signatures if enabled) instead of using only visual/state inputs.
-        use_signature_indexed_slot_memory: Whether to replace the legacy GRU-style
-            visual prefix memory updater with a Signature-Indexed Slot Memory
-            (SISM) updater that performs signature-driven slot routing and
-            slot-wise gated writes.
-        use_memory_conditioned_encoder_film: Whether to let the pooled visual prefix
-            memory state FiLM-modulate the current-step ACT encoder tokens before
-            the transformer encoder runs. This gives the encoder a direct
-            task-context pathway instead of relying only on decoder cross-attention
-            to the memory token.
-        num_memory_slots: Number of visual prefix memory slots injected into the encoder.
-            Each slot keeps an independent GRU-style memory state. The minimal
-            experiments in this repository use 1 or 2 slots.
-        slot_memory_num_slots: Number of SISM slots when
-            `use_signature_indexed_slot_memory=True`.
-        slot_memory_routing_hidden_dim: Hidden dimension used by the SISM routing
-            network and slot-addressing projections.
-        slot_memory_use_delta_routing: Whether delta signatures participate in the
-            explicit SISM routing signal in addition to path signatures.
-        slot_memory_use_softmax_routing: Whether SISM routing weights are produced
-            by a softmax over slots. If disabled, independent sigmoid routing
-            strengths are used instead.
-        slot_memory_use_readout_pooling: Whether SISM should compute an attention
-            readout context from the slot state for encoder FiLM conditioning.
-            If disabled, FiLM falls back to mean pooling over slots.
-        slot_memory_balance_loss_coef: Optional coefficient for a routing-balance
-            auxiliary loss. Defaults to 0.0, which disables the term.
-        slot_memory_consistency_loss_coef: Optional coefficient for a readout/write
-            consistency auxiliary loss. Defaults to 0.0, which disables the term.
-        temporal_ensemble_coeff: Coefficient for the exponential weighting scheme to apply for temporal
-            ensembling. Defaults to None which means temporal ensembling is not used. `n_action_steps` must be
-            1 when using this feature, as inference needs to happen at every step to form an ensemble. For
-            more information on how ensembling works, please see `ACTTemporalEnsembler`.
-        dropout: Dropout to use in the transformer layers (see code for details).
-        kl_weight: The weight to use for the KL-divergence component of the loss if the variational objective
-            is enabled. Loss is then calculated as: `reconstruction_loss + kl_weight * kld_loss`.
+    Path signatures, their increments, prefix reconstruction and signature-indexed
+    slot memory are always present. Configure sensor features, history budgets
+    and model dimensions for the target task. Architecture facts are read-only
+    properties rather than experiment switches.
     """
 
     # Input / output structure.
@@ -183,27 +88,13 @@ class StreamingACTConfig(PreTrainedConfig):
     use_vae: bool = True
     latent_dim: int = 32
     n_vae_encoder_layers: int = 4
-
-    # Extra conditioning inputs.
-    use_first_frame_anchor: bool = False
-    use_path_signature: bool = False
-    use_prefix_sequence_training: bool = False
     prefix_train_max_steps: int = 32
     prefix_frame_stride: int = 1
     prefix_pad_value: float = 0.0
-    use_visual_prefix_memory: bool = False
-    use_delta_signature: bool = False
-    use_signature_conditioned_visual_prefix_memory: bool = False
-    use_signature_indexed_slot_memory: bool = False
-    use_memory_conditioned_encoder_film: bool = False
-    num_memory_slots: int = 1
     slot_memory_num_slots: int = 4
     slot_memory_routing_hidden_dim: int = 512
-    slot_memory_use_delta_routing: bool = False
-    slot_memory_use_softmax_routing: bool = True
-    slot_memory_use_readout_pooling: bool = True
-    slot_memory_balance_loss_coef: float = 0.0
-    slot_memory_consistency_loss_coef: float = 0.0
+    slot_memory_identity_scale: float = 0.1
+    slot_memory_routing_temperature: float = 1.0
 
     # Streaming path-signature history module.
     history_length: int = 10
@@ -250,109 +141,53 @@ class StreamingACTConfig(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
-        if self.use_path_signature:
-            if self.history_length <= 0:
-                raise ValueError(f"`history_length` must be > 0. Got {self.history_length}.")
-            if self.signature_dim < 0:
-                raise ValueError(f"`signature_dim` must be >= 0. Got {self.signature_dim}.")
-            if self.signature_depth <= 0:
-                raise ValueError(f"`signature_depth` must be > 0. Got {self.signature_depth}.")
-            if self.signature_hidden_dim <= 0:
-                raise ValueError(
-                    f"`signature_hidden_dim` must be > 0. Got {self.signature_hidden_dim}."
-                )
-            if not (0.0 <= self.signature_dropout <= 1.0):
-                raise ValueError(
-                    f"`signature_dropout` must be in [0, 1]. Got {self.signature_dropout}."
-                )
-        if self.use_delta_signature and not self.use_path_signature:
+        if self.history_length <= 0:
+            raise ValueError(f"`history_length` must be > 0. Got {self.history_length}.")
+        if self.signature_dim < 0:
+            raise ValueError(f"`signature_dim` must be >= 0. Got {self.signature_dim}.")
+        if self.signature_depth <= 0:
+            raise ValueError(f"`signature_depth` must be > 0. Got {self.signature_depth}.")
+        if self.signature_hidden_dim <= 0:
             raise ValueError(
-                "`use_delta_signature=True` requires `use_path_signature=True` "
-                "because delta signatures are defined as differences between path signatures."
+                f"`signature_hidden_dim` must be > 0. Got {self.signature_hidden_dim}."
             )
-        if self.use_prefix_sequence_training:
-            if self.prefix_train_max_steps <= 0:
-                raise ValueError(
-                    "`prefix_train_max_steps` must be > 0 when "
-                    f"`use_prefix_sequence_training=True`. Got {self.prefix_train_max_steps}."
-                )
-            if self.prefix_frame_stride <= 0:
-                raise ValueError(
-                    "`prefix_frame_stride` must be > 0 when "
-                    f"`use_prefix_sequence_training=True`. Got {self.prefix_frame_stride}."
-                )
-        if self.use_visual_prefix_memory:
-            if not self.use_prefix_sequence_training:
-                raise ValueError(
-                    "`use_visual_prefix_memory=True` requires "
-                    "`use_prefix_sequence_training=True` so the training path can "
-                    "reconstruct memory from prefix sequences."
-                )
-            if self.num_memory_slots <= 0:
-                raise ValueError(
-                    "`use_visual_prefix_memory=True` requires "
-                    f"`num_memory_slots > 0`. Got {self.num_memory_slots}."
-                )
-        if self.use_signature_indexed_slot_memory:
-            if not self.use_visual_prefix_memory:
-                raise ValueError(
-                    "`use_signature_indexed_slot_memory=True` requires "
-                    "`use_visual_prefix_memory=True`."
-                )
-            if not self.use_path_signature:
-                raise ValueError(
-                    "`use_signature_indexed_slot_memory=True` requires "
-                    "`use_path_signature=True` because slot routing must be driven "
-                    "by path signatures."
-                )
-            if self.use_signature_conditioned_visual_prefix_memory:
-                raise ValueError(
-                    "`use_signature_indexed_slot_memory=True` is mutually exclusive "
-                    "with the legacy `use_signature_conditioned_visual_prefix_memory` "
-                    "GRU updater."
-                )
-            if self.slot_memory_num_slots <= 0:
-                raise ValueError(
-                    "`slot_memory_num_slots` must be > 0 when "
-                    "`use_signature_indexed_slot_memory=True`. "
-                    f"Got {self.slot_memory_num_slots}."
-                )
-            if self.slot_memory_routing_hidden_dim <= 0:
-                raise ValueError(
-                    "`slot_memory_routing_hidden_dim` must be > 0 when "
-                    "`use_signature_indexed_slot_memory=True`. "
-                    f"Got {self.slot_memory_routing_hidden_dim}."
-                )
-            if self.slot_memory_use_delta_routing and not self.use_delta_signature:
-                raise ValueError(
-                    "`slot_memory_use_delta_routing=True` requires "
-                    "`use_delta_signature=True`."
-                )
-            if self.slot_memory_balance_loss_coef < 0.0:
-                raise ValueError(
-                    "`slot_memory_balance_loss_coef` must be >= 0.0. "
-                    f"Got {self.slot_memory_balance_loss_coef}."
-                )
-            if self.slot_memory_consistency_loss_coef < 0.0:
-                raise ValueError(
-                    "`slot_memory_consistency_loss_coef` must be >= 0.0. "
-                    f"Got {self.slot_memory_consistency_loss_coef}."
-                )
-        if self.use_signature_conditioned_visual_prefix_memory:
-            if not self.use_visual_prefix_memory:
-                raise ValueError(
-                    "`use_signature_conditioned_visual_prefix_memory=True` requires "
-                    "`use_visual_prefix_memory=True`."
-                )
-            if not self.use_path_signature:
-                raise ValueError(
-                    "`use_signature_conditioned_visual_prefix_memory=True` requires "
-                    "`use_path_signature=True`."
-                )
-        if self.use_memory_conditioned_encoder_film and not self.use_visual_prefix_memory:
+        if not (0.0 <= self.signature_dropout <= 1.0):
             raise ValueError(
-                "`use_memory_conditioned_encoder_film=True` requires "
-                "`use_visual_prefix_memory=True` so the FiLM path has a memory state to use."
+                f"`signature_dropout` must be in [0, 1]. Got {self.signature_dropout}."
+            )
+        if self.prefix_train_max_steps <= 0:
+            raise ValueError(
+                "`prefix_train_max_steps` must be > 0 when "
+                f"TRACE prefix reconstruction. Got {self.prefix_train_max_steps}."
+            )
+        if self.prefix_frame_stride <= 0:
+            raise ValueError(
+                "`prefix_frame_stride` must be > 0 when "
+                f"TRACE prefix reconstruction. Got {self.prefix_frame_stride}."
+            )
+        if self.slot_memory_num_slots <= 0:
+            raise ValueError(
+                "`slot_memory_num_slots` must be > 0 when "
+                "TRACE slot memory. "
+                f"Got {self.slot_memory_num_slots}."
+            )
+        if self.slot_memory_routing_hidden_dim <= 0:
+            raise ValueError(
+                "`slot_memory_routing_hidden_dim` must be > 0 when "
+                "TRACE slot memory. "
+                f"Got {self.slot_memory_routing_hidden_dim}."
+            )
+        if self.slot_memory_identity_scale < 0.0:
+            raise ValueError(
+                "`slot_memory_identity_scale` must be >= 0.0 when "
+                "TRACE slot memory. "
+                f"Got {self.slot_memory_identity_scale}."
+            )
+        if self.slot_memory_routing_temperature <= 0.0:
+            raise ValueError(
+                "`slot_memory_routing_temperature` must be > 0.0 when "
+                "TRACE slot memory. "
+                f"Got {self.slot_memory_routing_temperature}."
             )
 
     def get_optimizer_preset(self) -> AdamWConfig:
@@ -366,184 +201,141 @@ class StreamingACTConfig(PreTrainedConfig):
 
     def validate_features(self) -> None:
         if not self.visual_observation_features and not self.env_state_feature:
-            raise ValueError("You must provide at least one image or the environment state among the inputs.")
-        if self.use_first_frame_anchor:
-            if not self.visual_observation_features:
-                raise ValueError(
-                    "`use_first_frame_anchor=True` requires at least one regular observation image "
-                    "feature in addition to the anchor image."
-                )
-            anchor_feature = self.first_frame_anchor_feature
-            if anchor_feature is None:
-                raise ValueError(
-                    "`use_first_frame_anchor=True` requires dataset/config input feature "
-                    f"`{FIRST_FRAME_ANCHOR_KEY}`."
-                )
-            first_visual_feature = next(iter(self.visual_observation_features.values()))
-            if tuple(anchor_feature.shape) != tuple(first_visual_feature.shape):
-                raise ValueError(
-                    "First-frame anchor image must match the regular observation image shape. "
-                    f"Got anchor={tuple(anchor_feature.shape)} vs "
-                    f"observation={tuple(first_visual_feature.shape)}."
-                )
-        if self.use_path_signature:
-            path_signature_feature = self.path_signature_feature
-            if path_signature_feature is None:
-                raise ValueError(
-                    f"`use_path_signature=True` requires input feature `{PATH_SIGNATURE_KEY}`."
-                )
-            expected_signature_shape = (self.signature_dim,)
-            if tuple(path_signature_feature.shape) != expected_signature_shape:
-                raise ValueError(
-                    "Path-signature feature shape mismatch. "
-                    f"Expected {expected_signature_shape}, got "
-                    f"{tuple(path_signature_feature.shape)}."
-                )
-        if self.use_prefix_sequence_training:
-            if not self.robot_state_feature:
-                raise ValueError(
-                    "`use_prefix_sequence_training=True` requires a current "
-                    "`observation.state` feature."
-                )
-            prefix_state_feature = self.prefix_state_feature
-            if prefix_state_feature is None:
-                raise ValueError(
-                    "`use_prefix_sequence_training=True` requires input feature "
-                    f"`{PREFIX_STATE_KEY}`."
-                )
-            expected_prefix_state_shape = (
-                self.prefix_train_max_steps,
-                self.robot_state_feature.shape[0],
+            raise ValueError(
+                "You must provide at least one image or the environment state among the inputs."
             )
-            if tuple(prefix_state_feature.shape) != expected_prefix_state_shape:
-                raise ValueError(
-                    "Prefix state feature shape mismatch. "
-                    f"Expected {expected_prefix_state_shape}, got {tuple(prefix_state_feature.shape)}."
-                )
+        path_signature_feature = self.path_signature_feature
+        if path_signature_feature is None:
+            raise ValueError(
+                f"TRACE signature conditioning requires input feature `{PATH_SIGNATURE_KEY}`."
+            )
+        expected_signature_shape = (self.signature_dim,)
+        if tuple(path_signature_feature.shape) != expected_signature_shape:
+            raise ValueError(
+                "Path-signature feature shape mismatch. "
+                f"Expected {expected_signature_shape}, got "
+                f"{tuple(path_signature_feature.shape)}."
+            )
+        if not self.robot_state_feature:
+            raise ValueError(
+                "TRACE prefix reconstruction requires a current `observation.state` feature."
+            )
+        prefix_state_feature = self.prefix_state_feature
+        if prefix_state_feature is None:
+            raise ValueError(
+                f"TRACE prefix reconstruction requires input feature `{PREFIX_STATE_KEY}`."
+            )
+        expected_prefix_state_shape = (
+            self.prefix_train_max_steps,
+            self.robot_state_feature.shape[0],
+        )
+        if tuple(prefix_state_feature.shape) != expected_prefix_state_shape:
+            raise ValueError(
+                "Prefix state feature shape mismatch. "
+                f"Expected {expected_prefix_state_shape}, got {tuple(prefix_state_feature.shape)}."
+            )
 
-            prefix_mask_feature = self.prefix_mask_feature
-            if prefix_mask_feature is None:
-                raise ValueError(
-                    "`use_prefix_sequence_training=True` requires input feature "
-                    f"`{PREFIX_MASK_KEY}`."
-                )
-            if tuple(prefix_mask_feature.shape) != (self.prefix_train_max_steps,):
-                raise ValueError(
-                    "Prefix mask feature shape mismatch. "
-                    f"Expected {(self.prefix_train_max_steps,)}, got {tuple(prefix_mask_feature.shape)}."
-                )
+        prefix_mask_feature = self.prefix_mask_feature
+        if prefix_mask_feature is None:
+            raise ValueError(
+                f"TRACE prefix reconstruction requires input feature `{PREFIX_MASK_KEY}`."
+            )
+        if tuple(prefix_mask_feature.shape) != (self.prefix_train_max_steps,):
+            raise ValueError(
+                "Prefix mask feature shape mismatch. "
+                f"Expected {(self.prefix_train_max_steps,)}, got {tuple(prefix_mask_feature.shape)}."
+            )
 
-            if not self.prefix_image_features:
-                raise ValueError(
-                    "`use_prefix_sequence_training=True` requires at least one "
-                    "`observation.prefix_images.*` feature."
-                )
+        if not self.prefix_image_features:
+            raise ValueError(
+                "TRACE prefix reconstruction requires at least one "
+                "`observation.prefix_images.*` feature."
+            )
 
-            if len(self.prefix_image_features) != len(self.visual_observation_features):
-                raise ValueError(
-                    "Prefix image feature count must match the number of regular observation cameras. "
-                    f"Got prefix={len(self.prefix_image_features)} vs "
-                    f"current={len(self.visual_observation_features)}."
-                )
+        if len(self.prefix_image_features) != len(self.visual_observation_features):
+            raise ValueError(
+                "Prefix image feature count must match the number of regular observation cameras. "
+                f"Got prefix={len(self.prefix_image_features)} vs "
+                f"current={len(self.visual_observation_features)}."
+            )
 
-            current_image_shapes = {}
-            for key, feature in self.visual_observation_features.items():
-                if key.startswith("observation.images."):
-                    suffix = key.removeprefix("observation.images.")
-                elif key == "observation.image":
-                    suffix = "main"
-                else:
-                    raise ValueError(
-                        "Unsupported current image feature name for prefix-sequence mode. "
-                        f"Got `{key}`."
-                    )
-                current_image_shapes[suffix] = tuple(feature.shape)
-            for prefix_key, prefix_feature in self.prefix_image_features.items():
-                suffix = prefix_key.removeprefix(PREFIX_IMAGES_PREFIX)
-                current_shape = current_image_shapes.get(suffix)
-                if current_shape is None:
-                    raise ValueError(
-                        "Prefix image feature does not map to any regular observation image. "
-                        f"Got prefix key `{prefix_key}`."
-                    )
-                expected_prefix_shape = (self.prefix_train_max_steps, *current_shape)
-                if tuple(prefix_feature.shape) != expected_prefix_shape:
-                    raise ValueError(
-                        "Prefix image feature shape mismatch. "
-                        f"Expected {expected_prefix_shape} for `{prefix_key}`, "
-                        f"got {tuple(prefix_feature.shape)}."
-                    )
+        current_image_shapes = {}
+        for key, feature in self.visual_observation_features.items():
+            if key.startswith("observation.images."):
+                suffix = key.removeprefix("observation.images.")
+            elif key == "observation.image":
+                suffix = "main"
+            else:
+                raise ValueError(
+                    f"Unsupported current image feature name for prefix-sequence mode. Got `{key}`."
+                )
+            current_image_shapes[suffix] = tuple(feature.shape)
+        for prefix_key, prefix_feature in self.prefix_image_features.items():
+            suffix = prefix_key.removeprefix(PREFIX_IMAGES_PREFIX)
+            current_shape = current_image_shapes.get(suffix)
+            if current_shape is None:
+                raise ValueError(
+                    "Prefix image feature does not map to any regular observation image. "
+                    f"Got prefix key `{prefix_key}`."
+                )
+            expected_prefix_shape = (self.prefix_train_max_steps, *current_shape)
+            if tuple(prefix_feature.shape) != expected_prefix_shape:
+                raise ValueError(
+                    "Prefix image feature shape mismatch. "
+                    f"Expected {expected_prefix_shape} for `{prefix_key}`, "
+                    f"got {tuple(prefix_feature.shape)}."
+                )
+        prefix_signature_feature = self.prefix_path_signature_feature
+        if prefix_signature_feature is None:
+            raise ValueError(
+                "TRACE prefix reconstruction requires input feature "
+                f"`{PREFIX_PATH_SIGNATURE_KEY}` when TRACE signature conditioning."
+            )
+        expected_prefix_signature_shape = (
+            self.prefix_train_max_steps,
+            self.signature_dim,
+        )
+        if tuple(prefix_signature_feature.shape) != expected_prefix_signature_shape:
+            raise ValueError(
+                "Prefix path-signature feature shape mismatch. "
+                f"Expected {expected_prefix_signature_shape}, got "
+                f"{tuple(prefix_signature_feature.shape)}."
+            )
+        delta_signature_feature = self.delta_signature_feature
+        if delta_signature_feature is None:
+            raise ValueError(
+                f"TRACE signature increments requires input feature `{DELTA_SIGNATURE_KEY}`."
+            )
+        expected_delta_signature_shape = (self.signature_dim,)
+        if tuple(delta_signature_feature.shape) != expected_delta_signature_shape:
+            raise ValueError(
+                "Delta-signature feature shape mismatch. "
+                f"Expected {expected_delta_signature_shape}, got "
+                f"{tuple(delta_signature_feature.shape)}."
+            )
 
-            if self.use_path_signature:
-                prefix_signature_feature = self.prefix_path_signature_feature
-                if prefix_signature_feature is None:
-                    raise ValueError(
-                        "`use_prefix_sequence_training=True` requires input feature "
-                        f"`{PREFIX_PATH_SIGNATURE_KEY}` when `use_path_signature=True`."
-                    )
-                expected_prefix_signature_shape = (
-                    self.prefix_train_max_steps,
-                    self.signature_dim,
-                )
-                if tuple(prefix_signature_feature.shape) != expected_prefix_signature_shape:
-                    raise ValueError(
-                        "Prefix path-signature feature shape mismatch. "
-                        f"Expected {expected_prefix_signature_shape}, got "
-                        f"{tuple(prefix_signature_feature.shape)}."
-                    )
-            if self.use_delta_signature:
-                delta_signature_feature = self.delta_signature_feature
-                if delta_signature_feature is None:
-                    raise ValueError(
-                        f"`use_delta_signature=True` requires input feature `{DELTA_SIGNATURE_KEY}`."
-                    )
-                expected_delta_signature_shape = (self.signature_dim,)
-                if tuple(delta_signature_feature.shape) != expected_delta_signature_shape:
-                    raise ValueError(
-                        "Delta-signature feature shape mismatch. "
-                        f"Expected {expected_delta_signature_shape}, got "
-                        f"{tuple(delta_signature_feature.shape)}."
-                    )
-
-                prefix_delta_signature_feature = self.prefix_delta_signature_feature
-                if prefix_delta_signature_feature is None:
-                    raise ValueError(
-                        "`use_prefix_sequence_training=True` requires input feature "
-                        f"`{PREFIX_DELTA_SIGNATURE_KEY}` when `use_delta_signature=True`."
-                    )
-                expected_prefix_delta_signature_shape = (
-                    self.prefix_train_max_steps,
-                    self.signature_dim,
-                )
-                if tuple(prefix_delta_signature_feature.shape) != expected_prefix_delta_signature_shape:
-                    raise ValueError(
-                        "Prefix delta-signature feature shape mismatch. "
-                        f"Expected {expected_prefix_delta_signature_shape}, got "
-                        f"{tuple(prefix_delta_signature_feature.shape)}."
-                    )
-        elif self.use_delta_signature:
-            delta_signature_feature = self.delta_signature_feature
-            if delta_signature_feature is None:
-                raise ValueError(
-                    f"`use_delta_signature=True` requires input feature `{DELTA_SIGNATURE_KEY}`."
-                )
-            expected_delta_signature_shape = (self.signature_dim,)
-            if tuple(delta_signature_feature.shape) != expected_delta_signature_shape:
-                raise ValueError(
-                    "Delta-signature feature shape mismatch. "
-                    f"Expected {expected_delta_signature_shape}, got "
-                    f"{tuple(delta_signature_feature.shape)}."
-                )
-        if self.use_visual_prefix_memory:
-            if not self.visual_observation_features:
-                raise ValueError(
-                    "`use_visual_prefix_memory=True` requires at least one regular "
-                    "observation image feature."
-                )
-            if not self.robot_state_feature:
-                raise ValueError(
-                    "`use_visual_prefix_memory=True` requires `observation.state`."
-                )
+        prefix_delta_signature_feature = self.prefix_delta_signature_feature
+        if prefix_delta_signature_feature is None:
+            raise ValueError(
+                "TRACE prefix reconstruction requires input feature "
+                f"`{PREFIX_DELTA_SIGNATURE_KEY}` when TRACE signature increments."
+            )
+        expected_prefix_delta_signature_shape = (
+            self.prefix_train_max_steps,
+            self.signature_dim,
+        )
+        if tuple(prefix_delta_signature_feature.shape) != expected_prefix_delta_signature_shape:
+            raise ValueError(
+                "Prefix delta-signature feature shape mismatch. "
+                f"Expected {expected_prefix_delta_signature_shape}, got "
+                f"{tuple(prefix_delta_signature_feature.shape)}."
+            )
+        if not self.visual_observation_features:
+            raise ValueError(
+                "TRACE visual memory requires at least one regular observation image feature."
+            )
+        if not self.robot_state_feature:
+            raise ValueError("TRACE visual memory requires `observation.state`.")
 
     @property
     def observation_delta_indices(self) -> None:
@@ -559,15 +351,7 @@ class StreamingACTConfig(PreTrainedConfig):
 
     @property
     def visual_observation_features(self) -> dict:
-        return {
-            key: ft
-            for key, ft in self.image_features.items()
-            if key != FIRST_FRAME_ANCHOR_KEY and not is_prefix_image_key(key)
-        }
-
-    @property
-    def first_frame_anchor_feature(self):
-        return self.image_features.get(FIRST_FRAME_ANCHOR_KEY)
+        return {key: ft for key, ft in self.image_features.items() if not is_prefix_image_key(key)}
 
     @property
     def prefix_state_feature(self):
@@ -607,12 +391,8 @@ class StreamingACTConfig(PreTrainedConfig):
 
     @property
     def prefix_image_features(self) -> dict:
-        return {
-            key: ft for key, ft in self.image_features.items() if is_prefix_image_key(key)
-        }
+        return {key: ft for key, ft in self.image_features.items() if is_prefix_image_key(key)}
 
     @property
     def active_visual_prefix_memory_num_slots(self) -> int:
-        if self.use_signature_indexed_slot_memory:
-            return int(self.slot_memory_num_slots)
-        return int(self.num_memory_slots)
+        return int(self.slot_memory_num_slots)

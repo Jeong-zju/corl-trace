@@ -1,14 +1,30 @@
-outputs/
-data/*
-!data/*.py
-!data/README.md
-!data/hfd.sh
-**/__pycache__/
-*.npz
-.cache
-**/.hf_home
-**/*.egg-info/
-depends/signatory/build/
+# Local environments and build products
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.cache/
+build/
+dist/
 *.so
-discussions/
-plot/
+# Credentials and editor state
+.env
+.env.*
+.vscode/
+.idea/
+# Research artifacts do not belong in the source distribution
+outputs/
+wandb/
+logs/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bag
+*.mcap
+*.parquet
+data/*/
+!data/configs/

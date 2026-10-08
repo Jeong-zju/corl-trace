@@ -31,8 +31,7 @@ def prefix_image_key_from_camera_key(camera_key: str) -> str:
     if camera_key == "observation.image":
         return PREFIX_IMAGES_PREFIX + "main"
     raise ValueError(
-        "Unsupported observation image key for prefix-sequence features: "
-        f"{camera_key!r}."
+        f"Unsupported observation image key for prefix-sequence features: {camera_key!r}."
     )
 
 
@@ -43,18 +42,14 @@ def select_prefix_positions(
     prefix_frame_stride: int,
 ) -> list[int]:
     if sequence_length <= 0:
-        raise ValueError(
-            f"`sequence_length` must be positive, got {sequence_length}."
-        )
+        raise ValueError(f"`sequence_length` must be positive, got {sequence_length}.")
     if prefix_train_max_steps <= 0:
         raise ValueError(
             "`prefix_train_max_steps` must be positive when prefix-sequence mode is "
             f"enabled, got {prefix_train_max_steps}."
         )
     if prefix_frame_stride <= 0:
-        raise ValueError(
-            f"`prefix_frame_stride` must be positive, got {prefix_frame_stride}."
-        )
+        raise ValueError(f"`prefix_frame_stride` must be positive, got {prefix_frame_stride}.")
 
     positions = list(range(0, sequence_length, prefix_frame_stride))
     last_position = sequence_length - 1
@@ -168,30 +163,23 @@ def clone_prefix_stats(
     *,
     base_stats: dict[str, dict[str, Any]],
     camera_keys: Sequence[str],
-    use_path_signature: bool,
-    use_delta_signature: bool,
 ) -> dict[str, dict[str, Any]]:
     stats = deepcopy(base_stats)
     if "observation.state" not in stats:
-        raise KeyError(
-            "`observation.state` stats are required to derive prefix-state stats."
-        )
+        raise KeyError("`observation.state` stats are required to derive prefix-state stats.")
     stats[PREFIX_STATE_KEY] = deepcopy(stats["observation.state"])
-
-    if use_path_signature:
-        if PATH_SIGNATURE_KEY not in stats:
-            raise KeyError(
-                f"`{PATH_SIGNATURE_KEY}` stats are required when prefix-sequence mode "
-                "is enabled with path signatures."
-            )
-        stats[PREFIX_PATH_SIGNATURE_KEY] = deepcopy(stats[PATH_SIGNATURE_KEY])
-    if use_delta_signature:
-        if DELTA_SIGNATURE_KEY not in stats:
-            raise KeyError(
-                f"`{DELTA_SIGNATURE_KEY}` stats are required when prefix-sequence mode "
-                "is enabled with delta signatures."
-            )
-        stats[PREFIX_DELTA_SIGNATURE_KEY] = deepcopy(stats[DELTA_SIGNATURE_KEY])
+    if PATH_SIGNATURE_KEY not in stats:
+        raise KeyError(
+            f"`{PATH_SIGNATURE_KEY}` stats are required when prefix-sequence mode "
+            "is enabled with path signatures."
+        )
+    stats[PREFIX_PATH_SIGNATURE_KEY] = deepcopy(stats[PATH_SIGNATURE_KEY])
+    if DELTA_SIGNATURE_KEY not in stats:
+        raise KeyError(
+            f"`{DELTA_SIGNATURE_KEY}` stats are required when prefix-sequence mode "
+            "is enabled with delta signatures."
+        )
+    stats[PREFIX_DELTA_SIGNATURE_KEY] = deepcopy(stats[DELTA_SIGNATURE_KEY])
 
     for camera_key in camera_keys:
         if camera_key not in stats:
@@ -204,9 +192,6 @@ def build_prefix_sequence_input_features(
     *,
     base_input_features: dict[str, PolicyFeature],
     prefix_train_max_steps: int,
-    use_path_signature: bool,
-    use_delta_signature: bool,
-    include_prefix_images: bool = True,
 ) -> dict[str, PolicyFeature]:
     if "observation.state" not in base_input_features:
         raise KeyError(
@@ -223,40 +208,34 @@ def build_prefix_sequence_input_features(
         type=FeatureType.STATE,
         shape=(prefix_train_max_steps,),
     )
-
-    if use_path_signature:
-        signature_feature = base_input_features.get(PATH_SIGNATURE_KEY)
-        if signature_feature is None:
-            raise KeyError(
-                f"`{PATH_SIGNATURE_KEY}` input feature is required when "
-                "`use_prefix_sequence_training=True`."
-            )
-        updated[PREFIX_PATH_SIGNATURE_KEY] = PolicyFeature(
-            type=FeatureType.STATE,
-            shape=(prefix_train_max_steps, *signature_feature.shape),
+    signature_feature = base_input_features.get(PATH_SIGNATURE_KEY)
+    if signature_feature is None:
+        raise KeyError(
+            f"`{PATH_SIGNATURE_KEY}` input feature is required when TRACE prefix reconstruction."
         )
-    if use_delta_signature:
-        delta_signature_feature = base_input_features.get(DELTA_SIGNATURE_KEY)
-        if delta_signature_feature is None:
-            raise KeyError(
-                f"`{DELTA_SIGNATURE_KEY}` input feature is required when "
-                "`use_prefix_sequence_training=True` and delta signatures are enabled."
-            )
-        updated[PREFIX_DELTA_SIGNATURE_KEY] = PolicyFeature(
-            type=FeatureType.STATE,
-            shape=(prefix_train_max_steps, *delta_signature_feature.shape),
+    updated[PREFIX_PATH_SIGNATURE_KEY] = PolicyFeature(
+        type=FeatureType.STATE,
+        shape=(prefix_train_max_steps, *signature_feature.shape),
+    )
+    delta_signature_feature = base_input_features.get(DELTA_SIGNATURE_KEY)
+    if delta_signature_feature is None:
+        raise KeyError(
+            f"`{DELTA_SIGNATURE_KEY}` input feature is required when "
+            "TRACE prefix reconstruction and delta signatures are enabled."
         )
-
-    if include_prefix_images:
-        for key, feature in list(base_input_features.items()):
-            if feature.type is not FeatureType.VISUAL:
-                continue
-            if is_prefix_image_key(key) or key == "observation.anchor_image":
-                continue
-            updated[prefix_image_key_from_camera_key(key)] = PolicyFeature(
-                type=FeatureType.VISUAL,
-                shape=(prefix_train_max_steps, *feature.shape),
-            )
+    updated[PREFIX_DELTA_SIGNATURE_KEY] = PolicyFeature(
+        type=FeatureType.STATE,
+        shape=(prefix_train_max_steps, *delta_signature_feature.shape),
+    )
+    for key, feature in list(base_input_features.items()):
+        if feature.type is not FeatureType.VISUAL:
+            continue
+        if is_prefix_image_key(key):
+            continue
+        updated[prefix_image_key_from_camera_key(key)] = PolicyFeature(
+            type=FeatureType.VISUAL,
+            shape=(prefix_train_max_steps, *feature.shape),
+        )
 
     return updated
 
@@ -270,6 +249,26 @@ def _ensure_prefix_image_sequence(camera_key: str, tensor: Tensor) -> Tensor:
             f"Got shape={tuple(tensor.shape)}."
         )
     return tensor
+
+
+def _split_prefetched_video_sequence(
+    camera_key: str,
+    tensor: Tensor | Any,
+) -> tuple[Tensor | None, Tensor]:
+    """Return history frames and the current frame from a prefetched video query."""
+    tensor = torch.as_tensor(tensor)
+    if tensor.ndim == 3:
+        return None, tensor
+    if tensor.ndim != 4:
+        raise ValueError(
+            f"Prefetched video for `{camera_key}` must have shape (T, C, H, W) or "
+            f"(C, H, W). Got shape={tuple(tensor.shape)}."
+        )
+    if int(tensor.shape[0]) <= 0:
+        raise ValueError(f"Prefetched video for `{camera_key}` must contain at least one frame.")
+    if int(tensor.shape[0]) == 1:
+        return None, tensor[0]
+    return tensor[:-1], tensor[-1]
 
 
 def _ensure_prefix_vector_sequence(feature_key: str, tensor: Tensor) -> Tensor:
@@ -291,8 +290,6 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
         prefix_train_max_steps: int,
         prefix_frame_stride: int,
         prefix_pad_value: float,
-        use_path_signature: bool,
-        use_delta_signature: bool,
         prefix_image_cache_reader=None,
     ) -> None:
         super().__init__()
@@ -302,21 +299,15 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
                 f"is enabled, got {prefix_train_max_steps}."
             )
         if prefix_frame_stride <= 0:
-            raise ValueError(
-                f"`prefix_frame_stride` must be positive, got {prefix_frame_stride}."
-            )
+            raise ValueError(f"`prefix_frame_stride` must be positive, got {prefix_frame_stride}.")
 
         self.base_dataset = base_dataset
         self.prefix_train_max_steps = int(prefix_train_max_steps)
         self.prefix_frame_stride = int(prefix_frame_stride)
         self.prefix_pad_value = float(prefix_pad_value)
-        self.use_path_signature = bool(use_path_signature)
-        self.use_delta_signature = bool(use_delta_signature)
         self.prefix_image_cache_reader = prefix_image_cache_reader
         self.camera_keys = tuple(
-            key
-            for key in base_dataset.meta.camera_keys
-            if is_supported_prefix_camera_key(key)
+            key for key in base_dataset.meta.camera_keys if is_supported_prefix_camera_key(key)
         )
         if not self.camera_keys:
             raise ValueError(
@@ -327,8 +318,6 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
         self.meta.stats = clone_prefix_stats(
             base_stats=self.meta.stats,
             camera_keys=self.camera_keys,
-            use_path_signature=self.use_path_signature,
-            use_delta_signature=self.use_delta_signature,
         )
 
     def _camera_uses_prefix_image_cache(self, camera_key: str) -> bool:
@@ -349,10 +338,7 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
 
         if self.base_dataset.image_transforms is not None:
             for camera_key in self.camera_keys:
-                if (
-                    camera_key in item
-                    and camera_key not in self.base_dataset.meta.video_keys
-                ):
+                if camera_key in item and camera_key not in self.base_dataset.meta.video_keys:
                     item[camera_key] = self.base_dataset.image_transforms(item[camera_key])
 
         task_idx = item["task_index"].item()
@@ -373,14 +359,12 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
         item: dict[str, Tensor | Any],
     ) -> None:
         required_keys = []
-        if self.use_path_signature:
-            required_keys.append(PATH_SIGNATURE_KEY)
-        if self.use_delta_signature:
-            required_keys.append(DELTA_SIGNATURE_KEY)
+        required_keys.append(PATH_SIGNATURE_KEY)
+        required_keys.append(DELTA_SIGNATURE_KEY)
         if not required_keys:
             return
 
-        missing_keys = [key for key in required_keys if key not in item]
+        missing_keys = [key for key in required_keys if key not in item or item[key] is None]
         if not missing_keys:
             return
         if "index" not in item:
@@ -396,7 +380,7 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
             if signature_cache_reader is not None and signature_cache_reader.has_key(key):
                 item[key] = signature_cache_reader.get(key, absolute_index)
 
-        remaining_keys = [key for key in required_keys if key not in item]
+        remaining_keys = [key for key in required_keys if key not in item or item[key] is None]
         if not remaining_keys:
             return
 
@@ -406,9 +390,7 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
         for key in remaining_keys:
             value = query_result.get(key)
             if value is None:
-                raise KeyError(
-                    f"Could not fetch required current-step signature feature `{key}`."
-                )
+                raise KeyError(f"Could not fetch required current-step signature feature `{key}`.")
             tensor = torch.as_tensor(value)
             item[key] = tensor[0] if tensor.ndim >= 2 and tensor.shape[0] == 1 else tensor
 
@@ -484,9 +466,9 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
         query_indices: dict[str, list[int]] = {}
         if history_abs_indices:
             query_indices["observation.state"] = history_abs_indices
-        if self.use_path_signature and history_abs_indices:
+        if history_abs_indices:
             query_indices[PATH_SIGNATURE_KEY] = history_abs_indices
-        if self.use_delta_signature and history_abs_indices:
+        if history_abs_indices:
             query_indices[DELTA_SIGNATURE_KEY] = history_abs_indices
         if history_abs_indices:
             for camera_key in self.camera_keys:
@@ -494,11 +476,7 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
                     continue
                 query_indices[camera_key] = history_abs_indices
 
-        hf_result = (
-            self.base_dataset._query_hf_dataset(query_indices)
-            if query_indices
-            else {}
-        )
+        hf_result = self.base_dataset._query_hf_dataset(query_indices) if query_indices else {}
         prefix: dict[str, Tensor] = {}
 
         state_history = hf_result.get("observation.state")
@@ -521,55 +499,52 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
             target_length=self.prefix_train_max_steps,
             pad_value=self.prefix_pad_value,
         )
-
-        if self.use_path_signature:
-            signature_history = hf_result.get(PATH_SIGNATURE_KEY)
-            current_signature = _ensure_prefix_vector_sequence(
-                PATH_SIGNATURE_KEY,
-                torch.as_tensor(current_item[PATH_SIGNATURE_KEY]),
+        signature_history = hf_result.get(PATH_SIGNATURE_KEY)
+        current_signature = _ensure_prefix_vector_sequence(
+            PATH_SIGNATURE_KEY,
+            torch.as_tensor(current_item[PATH_SIGNATURE_KEY]),
+        )
+        if signature_history is not None:
+            signature_tensor = torch.cat(
+                [
+                    _ensure_prefix_vector_sequence(PATH_SIGNATURE_KEY, signature_history),
+                    current_signature,
+                ],
+                dim=0,
             )
-            if signature_history is not None:
-                signature_tensor = torch.cat(
-                    [
-                        _ensure_prefix_vector_sequence(PATH_SIGNATURE_KEY, signature_history),
-                        current_signature,
-                    ],
-                    dim=0,
-                )
-            else:
-                signature_tensor = current_signature
-            prefix[PREFIX_PATH_SIGNATURE_KEY] = pad_prefix_tensor(
-                signature_tensor,
-                target_length=self.prefix_train_max_steps,
-                pad_value=self.prefix_pad_value,
+        else:
+            signature_tensor = current_signature
+        prefix[PREFIX_PATH_SIGNATURE_KEY] = pad_prefix_tensor(
+            signature_tensor,
+            target_length=self.prefix_train_max_steps,
+            pad_value=self.prefix_pad_value,
+        )
+        delta_signature_history = hf_result.get(DELTA_SIGNATURE_KEY)
+        current_delta_signature = _ensure_prefix_vector_sequence(
+            DELTA_SIGNATURE_KEY,
+            torch.as_tensor(current_item[DELTA_SIGNATURE_KEY]),
+        )
+        if delta_signature_history is not None:
+            delta_signature_tensor = torch.cat(
+                [
+                    _ensure_prefix_vector_sequence(DELTA_SIGNATURE_KEY, delta_signature_history),
+                    current_delta_signature,
+                ],
+                dim=0,
             )
-        if self.use_delta_signature:
-            delta_signature_history = hf_result.get(DELTA_SIGNATURE_KEY)
-            current_delta_signature = _ensure_prefix_vector_sequence(
-                DELTA_SIGNATURE_KEY,
-                torch.as_tensor(current_item[DELTA_SIGNATURE_KEY]),
-            )
-            if delta_signature_history is not None:
-                delta_signature_tensor = torch.cat(
-                    [
-                        _ensure_prefix_vector_sequence(
-                            DELTA_SIGNATURE_KEY, delta_signature_history
-                        ),
-                        current_delta_signature,
-                    ],
-                    dim=0,
-                )
-            else:
-                delta_signature_tensor = current_delta_signature
-            prefix[PREFIX_DELTA_SIGNATURE_KEY] = pad_prefix_tensor(
-                delta_signature_tensor,
-                target_length=self.prefix_train_max_steps,
-                pad_value=self.prefix_pad_value,
-            )
+        else:
+            delta_signature_tensor = current_delta_signature
+        prefix[PREFIX_DELTA_SIGNATURE_KEY] = pad_prefix_tensor(
+            delta_signature_tensor,
+            target_length=self.prefix_train_max_steps,
+            pad_value=self.prefix_pad_value,
+        )
 
         if prefetched_video_result is not None:
             video_result = prefetched_video_result
-        elif self.base_dataset.meta.video_keys and history_abs_indices:
+        elif history_abs_indices and any(
+            key in query_indices for key in self.base_dataset.meta.video_keys
+        ):
             query_timestamps = self.base_dataset._get_query_timestamps(
                 current_ts=float(current_item["timestamp"].item()),
                 query_indices=query_indices,
@@ -601,8 +576,11 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
                     full_image_tensor = video_result.get(camera_key)
                     history_image_tensor = (
                         None
-                        if full_image_tensor is None or int(full_image_tensor.shape[0]) <= 1
-                        else full_image_tensor[:-1]
+                        if full_image_tensor is None
+                        else _split_prefetched_video_sequence(
+                            camera_key,
+                            full_image_tensor,
+                        )[0]
                     )
                 else:
                     history_image_tensor = video_result.get(camera_key)
@@ -611,9 +589,7 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
 
             history_sequence = None
             if history_image_tensor is not None:
-                history_sequence = _ensure_prefix_image_sequence(
-                    camera_key, history_image_tensor
-                )
+                history_sequence = _ensure_prefix_image_sequence(camera_key, history_image_tensor)
                 if self.base_dataset.image_transforms is not None:
                     history_sequence = torch.stack(
                         [self.base_dataset.image_transforms(frame) for frame in history_sequence],
@@ -684,7 +660,10 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
             for camera_key in self.camera_keys:
                 if camera_key not in self.base_dataset.meta.video_keys:
                     continue
-                current_frame = prefetched_video_result[camera_key][-1]
+                _, current_frame = _split_prefetched_video_sequence(
+                    camera_key,
+                    prefetched_video_result[camera_key],
+                )
                 if self.base_dataset.image_transforms is not None:
                     current_frame = self.base_dataset.image_transforms(current_frame)
                 item[camera_key] = current_frame

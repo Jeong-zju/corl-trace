@@ -1,6 +1,5 @@
 from .robocasa import (
     DEFAULT_ROBOCASA_TASK,
-    RandomRoboCasaPolicy,
     RemoteRoboCasaBenchmarkEnv,
     RoboCasaBenchmarkEnv,
     RoboCasaEvaluationResult,
@@ -13,7 +12,6 @@ from .robocasa import (
 
 __all__ = [
     "DEFAULT_ROBOCASA_TASK",
-    "RandomRoboCasaPolicy",
     "RemoteRoboCasaBenchmarkEnv",
     "RoboCasaBenchmarkEnv",
     "RoboCasaEvaluationResult",

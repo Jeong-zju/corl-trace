@@ -1,7 +1,5 @@
 from __future__ import annotations
-
 from importlib import import_module
-
 
 _ENV_MODULES = {
     "h_shape": "env.h_shape_env",
@@ -21,7 +19,5 @@ def get_env_module(env_name: str):
         module_name = _ENV_MODULES[env_name]
     except KeyError as exc:
         supported = ", ".join(sorted(_ENV_MODULES))
-        raise ValueError(
-            f"Unsupported env={env_name!r}. Expected one of: {supported}"
-        ) from exc
+        raise ValueError(f"Unsupported env={env_name!r}. Expected one of: {supported}") from exc
     return import_module(module_name)

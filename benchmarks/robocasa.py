@@ -1,3 +1,5 @@
+"""RoboCasa environment and RPC helpers for evaluating an explicit TRACE policy."""
+
 from __future__ import annotations
 
 import argparse
@@ -273,45 +275,6 @@ def _rollout_result_to_dict(result: RoboCasaRolloutResult) -> dict[str, Any]:
     }
 
 
-def _rollout_result_from_dict(payload: Mapping[str, Any]) -> RoboCasaRolloutResult:
-    trajectory_payload = payload.get("trajectory")
-    return RoboCasaRolloutResult(
-        task=str(payload["task"]),
-        seed=None if payload.get("seed") is None else int(payload["seed"]),
-        max_steps=int(payload["max_steps"]),
-        num_steps=int(payload["num_steps"]),
-        total_reward=float(payload["total_reward"]),
-        success=bool(payload["success"]),
-        success_details={
-            str(key): bool(value)
-            for key, value in dict(payload["success_details"]).items()
-        },
-        terminated=bool(payload["terminated"]),
-        truncated=bool(payload["truncated"]),
-        done_reason=str(payload["done_reason"]),
-        initial_info=_safe_copy_info(dict(payload["initial_info"])),
-        final_info=_safe_copy_info(dict(payload["final_info"])),
-        initial_observation=(
-            None
-            if payload.get("initial_observation") is None
-            else _safe_copy_observation(dict(payload["initial_observation"]))
-        ),
-        final_observation=(
-            None
-            if payload.get("final_observation") is None
-            else _safe_copy_observation(dict(payload["final_observation"]))
-        ),
-        trajectory=(
-            None
-            if trajectory_payload is None
-            else [
-                _rollout_step_from_dict(dict(step_payload))
-                for step_payload in trajectory_payload
-            ]
-        ),
-        video_path=payload.get("video_path"),
-        details_path=payload.get("details_path"),
-    )
 
 
 def _json_default(value: Any) -> Any:
@@ -406,7 +369,7 @@ def _close_video_writer(writer, *, output_path: Path) -> None:
 def _run_rollout_with_env_api(
     env: Any,
     *,
-    policy: Any | None,
+    policy: Any,
     max_steps: int,
     seed: int | None,
     stop_on_success: bool,
@@ -420,9 +383,10 @@ def _run_rollout_with_env_api(
     if max_steps <= 0:
         raise ValueError("`max_steps` must be positive.")
 
-    rollout_policy = policy or RandomRoboCasaPolicy()
-    if hasattr(rollout_policy, "reset"):
-        rollout_policy.reset()
+    if not callable(getattr(policy, "act", None)):
+        raise TypeError("An explicit policy with act(observation, *, env=...) is required.")
+    if hasattr(policy, "reset"):
+        policy.reset()
 
     capture_video = video_path is not None
     if capture_video and not bool(getattr(env, "enable_render", True)) and video_image_key is None:
@@ -475,11 +439,7 @@ def _run_rollout_with_env_api(
 
         if not (success and stop_on_success):
             for step_index in range(int(max_steps)):
-                if not hasattr(rollout_policy, "act"):
-                    raise TypeError(
-                        "Rollout policy must define `act(observation, *, env=...)`."
-                    )
-                action = rollout_policy.act(current_observation, env=env)
+                action = policy.act(current_observation, env=env)
                 next_observation, reward, terminated, truncated, step_info = env.step(
                     action,
                     record_observation=record_observations,
@@ -554,7 +514,7 @@ def _run_rollout_with_env_api(
 def evaluate_policy_rollouts(
     env: Any,
     *,
-    policy: Any | None = None,
+    policy: Any,
     num_rollouts: int,
     max_steps: int,
     seed: int | None = None,
@@ -700,33 +660,6 @@ def list_available_robocasa_tasks(
         remote.close()
 
 
-class RandomRoboCasaPolicy:
-    def __init__(
-        self,
-        *,
-        freeze_base_motion: bool = True,
-        control_mode: float | None = None,
-        rng: np.random.Generator | None = None,
-    ) -> None:
-        self.freeze_base_motion = bool(freeze_base_motion)
-        self.control_mode = control_mode
-        self._rng = rng
-
-    def reset(self) -> None:
-        return None
-
-    def act(
-        self,
-        observation: Mapping[str, Any],
-        *,
-        env: "RoboCasaBenchmarkEnv",
-    ) -> np.ndarray:
-        action = env.sample_random_action(
-            freeze_base_motion=self.freeze_base_motion,
-            control_mode=self.control_mode,
-            rng=self._rng,
-        )
-        return action
 
 
 class RoboCasaBenchmarkEnv:
@@ -865,35 +798,6 @@ class RoboCasaBenchmarkEnv:
             self._augment_info(info, observation=observation_copy),
         )
 
-    def sample_random_action(
-        self,
-        *,
-        freeze_base_motion: bool = True,
-        control_mode: float | None = None,
-        rng: np.random.Generator | None = None,
-    ) -> np.ndarray:
-        sampled = self.action_space.sample()
-        if rng is not None:
-            for key, space in self.action_space.spaces.items():
-                if hasattr(space, "low") and hasattr(space, "high"):
-                    low = np.asarray(space.low, dtype=np.float32)
-                    high = np.asarray(space.high, dtype=np.float32)
-                    sampled[key] = rng.uniform(low=low, high=high).astype(
-                        np.float32, copy=False
-                    )
-                elif hasattr(space, "n"):
-                    sampled[key] = np.asarray(
-                        [rng.integers(int(space.n))], dtype=np.float32
-                    )
-        if freeze_base_motion and "action.base_motion" in sampled:
-            sampled["action.base_motion"] = np.zeros_like(
-                sampled["action.base_motion"], dtype=np.float32
-            )
-        if control_mode is not None and "action.control_mode" in sampled:
-            sampled["action.control_mode"] = np.asarray(
-                [control_mode], dtype=np.float32
-            )
-        return flatten_robocasa_action(sampled)
 
     def step(
         self,
@@ -932,7 +836,7 @@ class RoboCasaBenchmarkEnv:
     def rollout(
         self,
         *,
-        policy: Any | None = None,
+        policy: Any,
         max_steps: int = 200,
         seed: int | None = None,
         stop_on_success: bool = True,
@@ -960,7 +864,7 @@ class RoboCasaBenchmarkEnv:
     def evaluate_policy(
         self,
         *,
-        policy: Any | None = None,
+        policy: Any,
         num_rollouts: int,
         max_steps: int,
         seed: int | None = None,
@@ -1187,19 +1091,6 @@ class RemoteRoboCasaBenchmarkEnv:
         )
         return dict(result["observation"]), dict(result["info"])
 
-    def sample_random_action(
-        self,
-        *,
-        freeze_base_motion: bool = True,
-        control_mode: float | None = None,
-        rng: np.random.Generator | None = None,
-    ) -> np.ndarray:
-        result = self._remote.request(
-            "sample_random_action",
-            freeze_base_motion=freeze_base_motion,
-            control_mode=control_mode,
-        )
-        return np.asarray(result, dtype=np.float32).reshape(-1)
 
     def step(
         self,
@@ -1230,7 +1121,7 @@ class RemoteRoboCasaBenchmarkEnv:
     def rollout(
         self,
         *,
-        policy: Any | None = None,
+        policy: Any,
         max_steps: int = 200,
         seed: int | None = None,
         stop_on_success: bool = True,
@@ -1241,25 +1132,6 @@ class RemoteRoboCasaBenchmarkEnv:
         video_fps: int = 20,
         video_image_key: str | None = None,
     ) -> RoboCasaRolloutResult:
-        rollout_policy = policy or RandomRoboCasaPolicy()
-        if (
-            isinstance(rollout_policy, RandomRoboCasaPolicy)
-            and video_path is None
-            and details_path is None
-            and not record_trajectory
-            and not record_observations
-        ):
-            result = self._remote.request(
-                "rollout_random",
-                max_steps=max_steps,
-                seed=seed,
-                stop_on_success=stop_on_success,
-                record_trajectory=record_trajectory,
-                record_observations=record_observations,
-                freeze_base_motion=rollout_policy.freeze_base_motion,
-                control_mode=rollout_policy.control_mode,
-            )
-            return _rollout_result_from_dict(dict(result))
         return _run_rollout_with_env_api(
             self,
             policy=policy,
@@ -1277,7 +1149,7 @@ class RemoteRoboCasaBenchmarkEnv:
     def evaluate_policy(
         self,
         *,
-        policy: Any | None = None,
+        policy: Any,
         num_rollouts: int,
         max_steps: int,
         seed: int | None = None,
@@ -1350,10 +1222,6 @@ def _run_server() -> int:
                     "observation": observation,
                     "info": info,
                 }
-            elif command == "sample_random_action":
-                if env is None:
-                    raise RuntimeError("Remote RoboCasa env has not been created yet.")
-                result = env.sample_random_action(**kwargs)
             elif command == "step":
                 if env is None:
                     raise RuntimeError("Remote RoboCasa env has not been created yet.")
@@ -1369,14 +1237,6 @@ def _run_server() -> int:
                 if env is None:
                     raise RuntimeError("Remote RoboCasa env has not been created yet.")
                 result = env.render_frame(**kwargs)
-            elif command == "rollout_random":
-                if env is None:
-                    raise RuntimeError("Remote RoboCasa env has not been created yet.")
-                policy = RandomRoboCasaPolicy(
-                    freeze_base_motion=bool(kwargs.pop("freeze_base_motion", True)),
-                    control_mode=kwargs.pop("control_mode", None),
-                )
-                result = _rollout_result_to_dict(env.rollout(policy=policy, **kwargs))
             elif command == "close":
                 if env is not None:
                     env.close()
@@ -1404,155 +1264,17 @@ def _run_server() -> int:
     return 0
 
 
-def _build_cli_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Launch a RoboCasa task, run a random-policy rollout, and report "
-            "reward / success metrics."
-        )
-    )
-    parser.add_argument("--task", type=str, default=DEFAULT_ROBOCASA_TASK)
-    parser.add_argument(
-        "--conda-env",
-        type=str,
-        default=None,
-        help=(
-            "Optional conda environment name used to launch RoboCasa remotely. "
-            "Use this from another environment such as `corl-py312`."
-        ),
-    )
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--num-rollouts", type=int, default=1)
-    parser.add_argument("--max-steps", type=int, default=50)
-    parser.add_argument("--camera-width", type=int, default=256)
-    parser.add_argument("--camera-height", type=int, default=256)
-    parser.add_argument("--split", type=str, default="all")
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=None,
-        help="Optional directory used to save rollout / eval summaries and playback videos.",
-    )
-    parser.add_argument(
-        "--save-video",
-        action="store_true",
-        help="Save rollout playback as mp4 files under --output-dir.",
-    )
-    parser.add_argument(
-        "--video-fps",
-        type=int,
-        default=20,
-        help="Playback video fps.",
-    )
-    parser.add_argument(
-        "--video-image-key",
-        type=str,
-        default=None,
-        help="Optional image observation key to record instead of env.render().",
-    )
-    parser.add_argument(
-        "--disable-render",
-        action="store_true",
-        help="Disable image observations and replace them with black frames.",
-    )
-    parser.add_argument(
-        "--allow-base-motion",
-        action="store_true",
-        help="Let the random policy sample base motion instead of clamping it to zero.",
-    )
-    parser.add_argument(
-        "--list-tasks",
-        action="store_true",
-        help="List registered RoboCasa task names and exit.",
-    )
-    parser.add_argument(
-        "--print-observation-summary",
-        action="store_true",
-        help="Print the reset observation structure before rollout.",
-    )
+def main(argv: Sequence[str] | None = None) -> int:
+    """Start the simulator RPC service used by TRACE evaluation."""
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--serve",
         action="store_true",
-        help=argparse.SUPPRESS,
+        required=True,
+        help="Run the simulator RPC service for the TRACE evaluation adapter.",
     )
-    return parser
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = _build_cli_parser()
-    args = parser.parse_args(argv)
-
-    if args.serve:
-        return _run_server()
-
-    if args.list_tasks:
-        for task_name in list_available_robocasa_tasks(conda_env=args.conda_env):
-            print(task_name)
-        return 0
-
-    if args.save_video and args.output_dir is None:
-        raise ValueError("`--save-video` requires `--output-dir`.")
-
-    env = create_robocasa_benchmark_env(
-        conda_env=args.conda_env,
-        task=args.task,
-        seed=args.seed,
-        camera_width=args.camera_width,
-        camera_height=args.camera_height,
-        enable_render=not args.disable_render,
-        split=args.split,
-    )
-    try:
-        output_dir = None if args.output_dir is None else Path(args.output_dir)
-        if args.print_observation_summary:
-            observation, info = env.reset(seed=args.seed)
-            print(json.dumps(_summarize_observation(observation), indent=2))
-            print(json.dumps(_safe_copy_info(info), indent=2, default=str))
-
-        policy = RandomRoboCasaPolicy(
-            freeze_base_motion=not args.allow_base_motion
-        )
-        if int(args.num_rollouts) <= 1:
-            video_path = None
-            details_path = None
-            if output_dir is not None:
-                details_path = output_dir / "rollout_000.json"
-                if args.save_video:
-                    video_path = output_dir / "rollout_000.mp4"
-            result = env.rollout(
-                policy=policy,
-                max_steps=args.max_steps,
-                seed=args.seed,
-                stop_on_success=True,
-                record_trajectory=False,
-                record_observations=False,
-                video_path=video_path,
-                details_path=details_path,
-                video_fps=args.video_fps,
-                video_image_key=args.video_image_key,
-            )
-            if output_dir is not None:
-                _write_json(output_dir / "summary.json", result.to_summary_dict())
-            print(json.dumps(result.to_summary_dict(), indent=2, default=str))
-        else:
-            evaluation = env.evaluate_policy(
-                policy=policy,
-                num_rollouts=args.num_rollouts,
-                max_steps=args.max_steps,
-                seed=args.seed,
-                stop_on_success=True,
-                record_trajectory=False,
-                record_observations=False,
-                output_dir=output_dir,
-                save_videos=args.save_video,
-                video_fps=args.video_fps,
-                video_image_key=args.video_image_key,
-            )
-            print(json.dumps(evaluation.to_summary_dict(), indent=2, default=str))
-    finally:
-        env.close()
-
-    return 0
+    parser.parse_args(argv)
+    return _run_server()
 
 
 if __name__ == "__main__":

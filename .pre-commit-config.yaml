@@ -1,0 +1,16 @@
+exclude: ^(depends/|outputs/|wandb/)
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: Ruff (Python correctness)
+        entry: python -m ruff check
+        language: system
+        types_or: [python, pyi]
+      - id: release-check
+        name: Check release metadata and tracked files
+        entry: python scripts/check_release.py
+        language: system
+        pass_filenames: false
+        always_run: true
+

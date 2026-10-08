@@ -1,0 +1,10 @@
+TRACE: Trajectory-Routed Causal Memory for Delayed-Evidence Visuomotor Imitation
+Copyright 2026 TRACE contributors.
+
+Original TRACE contributions are licensed under the Apache License, Version 2.0.
+This distribution includes adaptations of LeRobot ACT and Diffusion Policy
+components and a vendored Signatory library. Their original copyright notices
+and licenses remain applicable. See THIRD_PARTY_NOTICES.md.
+
+The project name, institutional affiliations, and paper authorship do not grant
+trademark rights or imply endorsement by upstream contributors.

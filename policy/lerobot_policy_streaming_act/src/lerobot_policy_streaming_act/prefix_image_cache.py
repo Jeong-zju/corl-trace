@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import re
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -12,6 +15,8 @@ import pyarrow.parquet as pq
 import torch
 
 _CACHE_LAYOUT_VERSION = 1
+_CACHE_BUILD_LOCK_STALE_TIMEOUT_S = 21600
+_CACHE_BUILD_LOCK_POLL_INTERVAL_S = 1.0
 
 
 def _maybe_create_tqdm(*, total: int, desc: str, unit: str):
@@ -43,8 +48,7 @@ def _mode_name(mode: str) -> str:
     mode_name = str(mode).lower()
     if mode_name not in {"off", "memmap", "ram"}:
         raise ValueError(
-            "`prefix-image-cache-mode` must be one of {'off', 'memmap', 'ram'}. "
-            f"Got {mode!r}."
+            f"`prefix-image-cache-mode` must be one of {{'off', 'memmap', 'ram'}}. Got {mode!r}."
         )
     return mode_name
 
@@ -82,6 +86,55 @@ def _build_dataset_manifest(dataset_root: Path) -> dict[str, Any]:
     }
 
 
+@contextmanager
+def _cache_build_lock(lock_path: Path, *, label: str):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    warned_waiting = False
+
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                lock_age_s = time.time() - lock_path.stat().st_mtime
+            except FileNotFoundError:
+                continue
+
+            if lock_age_s > _CACHE_BUILD_LOCK_STALE_TIMEOUT_S:
+                try:
+                    lock_path.unlink()
+                    print(
+                        "[WARN] "
+                        f"{label}: removed stale cache lock {lock_path} "
+                        f"(age={lock_age_s:.0f}s)"
+                    )
+                    continue
+                except FileNotFoundError:
+                    continue
+
+            if not warned_waiting:
+                print(f"[INFO] {label}: waiting for cache lock {lock_path}")
+                warned_waiting = True
+            time.sleep(_CACHE_BUILD_LOCK_POLL_INTERVAL_S)
+            continue
+
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {"pid": os.getpid(), "created_at": dt.datetime.utcnow().isoformat() + "Z"}
+                )
+            )
+        break
+
+    try:
+        yield
+    finally:
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _default_cache_root(dataset_root: Path, dataset_repo_id: str) -> Path:
     return dataset_root / ".prefix_image_cache" / _sanitize_path_part(dataset_repo_id)
 
@@ -107,9 +160,7 @@ def _normalize_image_shape_to_chw(
 ) -> tuple[int, int, int]:
     dims = tuple(int(dim) for dim in shape)
     if len(dims) != 3:
-        raise ValueError(
-            f"Invalid camera feature shape for {key!r}: {shape}. Expected a 3D shape."
-        )
+        raise ValueError(f"Invalid camera feature shape for {key!r}: {shape}. Expected a 3D shape.")
 
     first_is_channel = dims[0] in {1, 3, 4}
     last_is_channel = dims[2] in {1, 3, 4}
@@ -138,8 +189,6 @@ def _resolve_camera_specs(info: dict[str, Any]) -> dict[str, tuple[int, int, int
         if dtype not in {"image", "video"}:
             continue
         key = str(key)
-        if key == "observation.anchor_image":
-            continue
         if key.startswith("observation.prefix_images."):
             continue
         if not (key.startswith("observation.images.") or key == "observation.image"):
@@ -152,8 +201,7 @@ def _resolve_camera_specs(info: dict[str, Any]) -> dict[str, tuple[int, int, int
         specs[key] = _normalize_image_shape_to_chw(shape, key=key)
     if not specs:
         raise KeyError(
-            "Could not resolve any regular observation image keys for the prefix "
-            "image cache."
+            "Could not resolve any regular observation image keys for the prefix image cache."
         )
     return specs
 
@@ -215,9 +263,7 @@ class PrefixImageCacheReader:
             return _convert_loaded_images(
                 source[torch.as_tensor(absolute_indices, dtype=torch.long)]
             )
-        return _convert_loaded_images(
-            source[np.asarray(absolute_indices, dtype=np.int64)]
-        )
+        return _convert_loaded_images(source[np.asarray(absolute_indices, dtype=np.int64)])
 
 
 @dataclass
@@ -437,9 +483,7 @@ def _build_prefix_image_cache(runtime: PrefixImageCacheRuntimeConfig) -> PrefixI
         "dataset_repo_id": runtime.dataset_repo_id,
         "cache_dtype": runtime.cache_dtype,
         "camera_keys": list(camera_specs.keys()),
-        "camera_specs": {
-            key: list(shape) for key, shape in camera_specs.items()
-        },
+        "camera_specs": {key: list(shape) for key, shape in camera_specs.items()},
         "estimated_bytes": total_bytes,
         "dataset_manifest": manifest,
     }
@@ -449,13 +493,13 @@ def _build_prefix_image_cache(runtime: PrefixImageCacheRuntimeConfig) -> PrefixI
     print(
         "[INFO] prefix_image_cache: ready "
         f"(cameras={len(camera_specs)}, frames={dataset_size}, "
-        f"size={reader.estimated_bytes / (1024 ** 3):.2f} GiB, "
+        f"size={reader.estimated_bytes / (1024**3):.2f} GiB, "
         f"elapsed={build_elapsed_s:.1f}s)"
     )
     if runtime.mode == "ram":
         print(
             "[INFO] prefix_image_cache: preloaded RAM "
-            f"({reader.estimated_bytes / (1024 ** 3):.2f} GiB)"
+            f"({reader.estimated_bytes / (1024**3):.2f} GiB)"
         )
     return reader
 
@@ -475,6 +519,7 @@ def prepare_prefix_image_cache_runtime() -> PrefixImageCacheReader | None:
         dataset_repo_id=runtime.dataset_repo_id,
         cache_root=runtime.cache_root,
     )
+    cache_dir.parent.mkdir(parents=True, exist_ok=True)
     metadata = None if runtime.refresh else _load_cache_metadata(cache_dir)
 
     if metadata is not None and _metadata_matches_runtime(
@@ -495,13 +540,40 @@ def prepare_prefix_image_cache_runtime() -> PrefixImageCacheReader | None:
         if runtime.mode == "ram":
             print(
                 "[INFO] prefix_image_cache: preloaded RAM "
-                f"({runtime.reader.estimated_bytes / (1024 ** 3):.2f} GiB)"
+                f"({runtime.reader.estimated_bytes / (1024**3):.2f} GiB)"
             )
         runtime.status = "ready"
         runtime.camera_specs = camera_specs
         return runtime.reader
 
-    runtime.reader = _build_prefix_image_cache(runtime)
-    runtime.status = "ready"
-    runtime.camera_specs = camera_specs
-    return runtime.reader
+    lock_path = cache_dir / ".build.lock"
+    with _cache_build_lock(lock_path, label="prefix_image_cache"):
+        metadata = None if runtime.refresh else _load_cache_metadata(cache_dir)
+        if metadata is not None and _metadata_matches_runtime(
+            metadata,
+            runtime=runtime,
+            manifest=manifest,
+            camera_specs=camera_specs,
+        ):
+            runtime.reader = _open_prefix_image_cache_reader(
+                cache_dir,
+                metadata,
+                mode=runtime.mode,
+            )
+            print(
+                "[INFO] prefix_image_cache: hit "
+                f"(mode={runtime.mode}, dtype={runtime.cache_dtype}, path={cache_dir})"
+            )
+            if runtime.mode == "ram":
+                print(
+                    "[INFO] prefix_image_cache: preloaded RAM "
+                    f"({runtime.reader.estimated_bytes / (1024**3):.2f} GiB)"
+                )
+            runtime.status = "ready"
+            runtime.camera_specs = camera_specs
+            return runtime.reader
+
+        runtime.reader = _build_prefix_image_cache(runtime)
+        runtime.status = "ready"
+        runtime.camera_specs = camera_specs
+        return runtime.reader

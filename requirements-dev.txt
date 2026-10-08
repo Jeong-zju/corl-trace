@@ -1,0 +1,5 @@
+# Developer tools; install requirements.txt separately for the full test suite.
+pytest>=8.3,<10
+ruff==0.16.10
+pre-commit>=4.2,<5
+

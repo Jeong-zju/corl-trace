@@ -1,0 +1,28 @@
+# Reference runtime: Python 3.12. Direct dependency versions match local validation.
+# Install system FFmpeg separately; build Signatory after installing PyTorch.
+# Both policy packages are installed from this checkout.
+numpy==2.2.6
+pandas==3.0.1
+pyarrow==23.0.1
+matplotlib==3.10.8
+scikit-learn==1.8.0
+pyyaml==6.0.3
+accelerate==1.13.0
+datasets==4.7.0
+einops==0.8.2
+fsspec==2026.2.0
+huggingface-hub==1.11.0
+lerobot==0.5.0
+mujoco==3.6.0
+opencv-python-headless==4.12.0.88
+robot-descriptions==1.23.0
+rosbags==0.11.0
+safetensors==0.7.0
+torch==2.9.1
+torchcodec==0.9.1
+torchvision==0.24.1
+tqdm==4.67.3
+transformers==5.4.0
+wandb==0.24.2
+-e ./policy/lerobot_policy_streaming_act
+-e ./policy/lerobot_policy_prism_diffusion

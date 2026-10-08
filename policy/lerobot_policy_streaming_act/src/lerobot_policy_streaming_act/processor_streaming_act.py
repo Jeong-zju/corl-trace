@@ -13,6 +13,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# TRACE modifications (2026): causal signatures and memory, with full-method specialization.
 from typing import Any
 
 import torch
@@ -28,7 +30,10 @@ from lerobot.processor import (
     UnnormalizerProcessorStep,
 )
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
-from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+from lerobot.utils.constants import (
+    POLICY_POSTPROCESSOR_DEFAULT_NAME,
+    POLICY_PREPROCESSOR_DEFAULT_NAME,
+)
 
 
 def make_streaming_act_pre_post_processors(
@@ -71,7 +76,9 @@ def make_streaming_act_pre_post_processors(
     ]
     output_steps = [
         UnnormalizerProcessorStep(
-            features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
+            features=config.output_features,
+            norm_map=config.normalization_mapping,
+            stats=dataset_stats,
         ),
         DeviceProcessorStep(device="cpu"),
     ]

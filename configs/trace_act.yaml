@@ -1,0 +1,38 @@
+# Full TRACE with the ACT interface. Reference recipe, not an archived paper run.
+# Supply your local LeRobot v3 dataset with --dataset.
+train:
+  output_root: outputs/train/trace-act
+  job_name: trace-act
+  device: cuda
+  seed: 42
+  steps: 100000
+  batch_size: 8
+  num_workers: 4
+  log_freq: 100
+  save_freq: 10000
+  eval_freq: -1
+  enable_wandb: false
+  wandb_mode: disabled
+  test_ratio: 0.2
+  split_seed: 42
+  split_shuffle: true
+  chunk_size: 100
+  n_action_steps: 100
+  signature_depth: 3
+  signature_hidden_dim: 512
+  signature_dropout: 0.1
+  prefix_train_max_steps: 32
+  prefix_frame_stride: 4
+  slot_memory_num_slots: 4
+  slot_memory_routing_hidden_dim: 512
+  slot_memory_identity_scale: 0.1
+  slot_memory_routing_temperature: 1.0
+
+eval:
+  train_output_root: outputs/train/trace-act
+  output_dir: outputs/eval/trace-act/{run_tag}
+  device: cuda
+  eval_split: test
+  seed: 42
+  n_action_steps: 1
+  temporal_ensemble_coeff: 0.0075

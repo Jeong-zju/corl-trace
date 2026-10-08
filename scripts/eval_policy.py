@@ -1,21 +1,24 @@
 from __future__ import annotations
-
+from trace_profile import FULL_TRACE_DEFAULTS
 import argparse
 import datetime as dt
+import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
-
 import numpy as np
-
 from dataset_utils import (
     DEFAULT_LOCAL_DATA_ROOT,
     build_dataset_split,
     find_dataset_split_file,
     infer_dataset_repo_id,
+    is_supported_lerobot_dataset_root,
     load_dataset_split,
     resolve_dataset_root,
     resolve_episode_indices_from_dataset_info,
@@ -23,23 +26,69 @@ from dataset_utils import (
 )
 from env import get_env_choices, get_env_module
 from eval_helpers import (
-    build_prefix_sequence_eval_inputs,
     compute_delta_signature_step_np,
     compute_signatory_signature_np,
-    compute_simple_signature_np,
-    ensure_prefix_sequence_batch_dims,
+    import_local_streaming_act_policy_class,
+    load_streaming_act_config_from_pretrained_dir,
+    load_pretrained_config_from_pretrained_dir,
     resolve_eval_policy_path,
     resolve_signature_backend,
+    quiet_transformers_loading,
     write_summary,
 )
-from policy_defaults import (
-    load_policy_mode_defaults,
-    load_policy_mode_defaults_for_dataset,
+from policy_capabilities import (
+    get_visual_memory_debug_stats,
+    policy_supports_signature_features,
+    resolve_policy_capability_flags,
 )
+from policy_defaults import load_policy_mode_defaults, load_policy_mode_defaults_for_dataset
+from policy_imports import ensure_lerobot_policy_imports, make_standard_pre_post_processors
+
+
+def make_pre_post_processors(
+    *,
+    policy_cfg,
+    pretrained_path=None,
+    preprocessor_overrides=None,
+    postprocessor_overrides=None,
+    dataset_stats=None,
+):
+    del pretrained_path
+    return make_standard_pre_post_processors(
+        policy_cfg,
+        dataset_stats=dataset_stats,
+        preprocessor_overrides=preprocessor_overrides,
+        postprocessor_overrides=postprocessor_overrides,
+    )
 
 
 DEFAULT_PATH_SIGNATURE_KEY = "observation.path_signature"
 DEFAULT_DELTA_SIGNATURE_KEY = "observation.delta_signature"
+ROBOCASA_TASK_COLLECTION_NAMES = frozenset({"atomic", "composite"})
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+POLICY_CHOICES = ("prism_diffusion", "streaming_act")
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from eval_visualization import (
+    make_slot_memory_history_sample,
+    render_attention_panel,
+    render_signature_panel,
+    render_slot_memory_panel,
+)
+from gripper_hysteresis import (
+    GripperHysteresis,
+    complete_gripper_hysteresis_config_from_dataset_stats,
+    parse_float_sequence,
+    parse_gripper_hysteresis_config,
+    parse_int_sequence,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedTaskSelector:
+    raw: str | None
+    items: tuple[str, ...]
+    canonical: str | None
 
 
 def maybe_create_tqdm(*, total: int, desc: str, unit: str):
@@ -61,55 +110,261 @@ def format_elapsed_s(elapsed_s: float) -> str:
     return f"{elapsed_s:.1f}s"
 
 
-def ensure_streaming_act_importable(repo_root: Path) -> None:
-    streaming_act_src = repo_root / "main/policy/lerobot_policy_streaming_act/src"
-    if not streaming_act_src.exists():
-        raise FileNotFoundError(
-            f"Streaming ACT package source not found: {streaming_act_src}"
+def build_per_episode_metric_series(
+    per_episode_metrics: list[dict[str, object]], *, metric_key: str
+) -> list[dict[str, object]]:
+    series: list[dict[str, object]] = []
+    for episode_metrics in per_episode_metrics:
+        metric_values = episode_metrics.get(metric_key, [])
+        if not isinstance(metric_values, list) or not metric_values:
+            continue
+        episode_index = episode_metrics.get("episode_index")
+        episode_values = np.asarray([float(value) for value in metric_values], dtype=np.float32)
+        series.append(
+            {
+                "episode_index": None if episode_index is None else int(episode_index),
+                "step_index": np.arange(episode_values.shape[0], dtype=np.int32),
+                "values": episode_values,
+            }
         )
+    return series
+
+
+def write_per_frame_metrics_json(
+    output_dir: Path, per_episode_metrics: list[dict[str, object]]
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = output_dir / "per_frame_metrics.json"
+    payload = {"episodes": per_episode_metrics}
+    metrics_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return metrics_path
+
+
+def _load_matplotlib_pyplot():
+    fallback_dir = Path(tempfile.gettempdir()) / "matplotlib-corl"
+    fallback_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(fallback_dir))
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+    return plt
+
+
+def maybe_write_per_frame_mae_plot(
+    output_dir: Path, per_episode_metrics: list[dict[str, object]]
+) -> Path | None:
+    plt = _load_matplotlib_pyplot()
+    if plt is None:
+        return None
+    series = build_per_episode_metric_series(per_episode_metrics, metric_key="frame_mae")
+    if not series:
+        return None
+    fig, ax = plt.subplots(figsize=(14, 7.2), layout="constrained")
+    cmap = plt.get_cmap("tab20", max(len(series), 1))
+    all_values: list[np.ndarray] = []
+    for idx, episode_series in enumerate(series):
+        episode_index = episode_series["episode_index"]
+        step_index = episode_series["step_index"]
+        values = episode_series["values"]
+        all_values.append(values)
+        ax.plot(
+            step_index,
+            values,
+            color=cmap(idx),
+            linewidth=1.2,
+            alpha=0.85,
+            label=f"episode={episode_index}" if episode_index is not None else f"episode_{idx}",
+        )
+    all_mae_values = np.concatenate(all_values, axis=0)
+    overall_mean = float(all_mae_values.mean())
+    ax.axhline(
+        overall_mean,
+        color="#2ca02c",
+        linestyle="--",
+        linewidth=1.0,
+        alpha=0.8,
+        label=f"Overall mean = {overall_mean:.4f}",
+    )
+    max_steps = max(
+        (
+            int(episode_series["step_index"][-1]) + 1
+            for episode_series in series
+            if len(episode_series["step_index"]) > 0
+        )
+    )
+    ax.set_xlim(left=0, right=max(1, max_steps - 1))
+    ax.set_title("Dataset Eval Per-Episode Frame MAE")
+    ax.set_xlabel("Step index within episode")
+    ax.set_ylabel("MAE")
+    ax.grid(True, alpha=0.2, linewidth=0.5)
+    legend_columns = 1 if len(series) <= 10 else 2 if len(series) <= 20 else 3
+    ax.legend(
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
+        borderaxespad=0.0,
+        ncol=legend_columns,
+        fontsize=8,
+    )
+    plot_path = output_dir / "per_frame_mae.png"
+    fig.savefig(plot_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return plot_path
+
+
+def start_ffmpeg_rgb_writer(output_path: Path, width: int, height: int, fps: int):
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{int(width)}x{int(height)}",
+        "-r",
+        str(int(fps)),
+        "-i",
+        "-",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        str(output_path),
+    ]
+    try:
+        return subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffmpeg is required to export dataset debug videos.") from exc
+
+
+def write_bgr_frame_to_ffmpeg(writer, frame_bgr: np.ndarray) -> None:
+    if writer.stdin is None:
+        raise RuntimeError("ffmpeg stdin is closed.")
+    import cv2
+
+    frame_bgr = np.asarray(frame_bgr, dtype=np.uint8)
+    if frame_bgr.ndim != 3 or frame_bgr.shape[2] != 3:
+        raise ValueError(f"Expected BGR frame with shape (H, W, 3), got {frame_bgr.shape}.")
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    writer.stdin.write(np.ascontiguousarray(frame_rgb).tobytes())
+
+
+def close_ffmpeg_writer(writer, *, output_path: Path) -> None:
+    if writer.stdin is not None and (not writer.stdin.closed):
+        writer.stdin.close()
+    return_code = writer.wait()
+    if return_code != 0:
+        raise RuntimeError(f"ffmpeg failed with code {return_code} for {output_path}")
+
+
+def tensor_image_to_uint8_hwc(value) -> np.ndarray:
+    import torch
+
+    if torch.is_tensor(value):
+        array = value.detach().cpu().numpy()
+    else:
+        array = np.asarray(value)
+    array = np.asarray(array)
+    if array.ndim == 4 and array.shape[0] == 1:
+        array = array[0]
+    if array.ndim == 3 and array.shape[0] in {1, 3, 4}:
+        array = np.moveaxis(array, 0, -1)
+    if array.ndim == 2:
+        array = np.repeat(array[..., None], 3, axis=2)
+    if array.ndim != 3:
+        raise ValueError(f"Expected image-like tensor with 2 or 3 dims, got {array.shape}.")
+    if array.shape[2] == 1:
+        array = np.repeat(array, 3, axis=2)
+    elif array.shape[2] > 3:
+        array = array[..., :3]
+    if np.issubdtype(array.dtype, np.floating):
+        max_value = float(np.nanmax(array)) if array.size else 0.0
+        min_value = float(np.nanmin(array)) if array.size else 0.0
+        if min_value >= -1e-05 and max_value <= 1.0 + 1e-05:
+            array = array * 255.0
+    return np.clip(array, 0, 255).astype(np.uint8)
+
+
+def debug_payload_to_numpy(value):
+    import torch
+
+    if torch.is_tensor(value):
+        return value.detach().cpu().numpy()
+    if isinstance(value, dict):
+        return {str(key): debug_payload_to_numpy(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [debug_payload_to_numpy(item) for item in value]
+    return value
+
+
+def get_policy_deploy_debug_snapshot(policy) -> dict[str, object] | None:
+    getter = getattr(policy, "get_deploy_debug_snapshot", None)
+    if not callable(getter):
+        return None
+    snapshot = getter()
+    if not isinstance(snapshot, dict):
+        return None
+    return debug_payload_to_numpy(snapshot)
+
+
+def load_feature_stats(dataset_root: Path, feature_key: str) -> dict[str, object] | None:
+    stats_path = dataset_root / "meta" / "stats.json"
+    if not stats_path.is_file():
+        return None
+    try:
+        stats_payload = json.loads(stats_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    feature_stats = stats_payload.get(feature_key)
+    return dict(feature_stats) if isinstance(feature_stats, dict) else None
+
+
+def make_signature_debug_payload(
+    *,
+    signature_vec: np.ndarray | None,
+    delta_signature_vec: np.ndarray | None,
+    signature_stats: dict[str, object] | None,
+    delta_signature_stats: dict[str, object] | None,
+    signature_backend: str | None,
+    history_length: int | None,
+    window_length: int,
+    dataset_root: Path,
+) -> dict[str, object]:
+    return {
+        "enabled": signature_vec is not None,
+        "backend": signature_backend or "disabled",
+        "history_length": history_length,
+        "window_length": int(window_length),
+        "dataset_root": str(dataset_root),
+        "signature": None if signature_vec is None else np.asarray(signature_vec, dtype=np.float32),
+        "delta_signature": None
+        if delta_signature_vec is None
+        else np.asarray(delta_signature_vec, dtype=np.float32),
+        "signature_stats": signature_stats,
+        "delta_signature_stats": delta_signature_stats,
+    }
+
+
+def ensure_streaming_act_importable(project_root: Path) -> None:
+    streaming_act_src = project_root / "policy" / "lerobot_policy_streaming_act" / "src"
+    if not streaming_act_src.exists():
+        raise FileNotFoundError(f"Streaming ACT package source not found: {streaming_act_src}")
     sys.path.insert(0, str(streaming_act_src))
 
 
-def validate_prefix_sequence_support(
-    *,
-    policy_name: str,
-    use_prefix_sequence_training: bool,
-) -> None:
-    if not use_prefix_sequence_training:
-        return
-    if policy_name != "streaming_act":
-        raise NotImplementedError(
-            "Prefix-sequence evaluation is currently implemented only for `streaming_act`. "
-            f"Got policy={policy_name!r}."
-        )
-
-
-def validate_visual_prefix_memory_support(
-    *,
-    policy_name: str,
-    use_visual_prefix_memory: bool,
-) -> None:
-    if not use_visual_prefix_memory:
-        return
-    if policy_name != "streaming_act":
-        raise NotImplementedError(
-            "Visual prefix memory evaluation is currently implemented only for "
-            f"`streaming_act`. Got policy={policy_name!r}."
-        )
-
-
-def validate_delta_signature_support(
-    *,
-    policy_name: str,
-    use_delta_signature: bool,
-) -> None:
-    if not use_delta_signature:
-        return
-    if policy_name != "streaming_act":
-        raise NotImplementedError(
-            "Delta-signature evaluation is currently implemented only for "
-            f"`streaming_act`. Got policy={policy_name!r}."
-        )
+def ensure_prism_diffusion_importable(project_root: Path) -> None:
+    prism_diffusion_src = project_root / "policy" / "lerobot_policy_prism_diffusion" / "src"
+    if not prism_diffusion_src.exists():
+        raise FileNotFoundError(f"PRISM Diffusion package source not found: {prism_diffusion_src}")
+    sys.path.insert(0, str(prism_diffusion_src))
 
 
 def default_policy_series_name(policy_name: str) -> str:
@@ -117,13 +372,225 @@ def default_policy_series_name(policy_name: str) -> str:
 
 
 def normalize_output_path_part(value: str) -> str:
-    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value).strip())
-    normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
+    normalized = re.sub("[^A-Za-z0-9._-]+", "-", str(value).strip())
+    normalized = re.sub("-{2,}", "-", normalized).strip("-")
     return normalized or "item"
 
 
-def ensure_writable_hf_cache_env(repo_root: Path) -> None:
-    cache_root = (repo_root / "main" / ".cache" / "huggingface").resolve()
+def normalize_cli_text(value: str | os.PathLike[str] | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().replace("\\", "/")
+    if not text:
+        return None
+    if text.startswith("./"):
+        text = text[2:]
+    while "//" in text:
+        text = text.replace("//", "/")
+    return text.rstrip("/")
+
+
+def normalize_csv_items(
+    value: str | list[str] | tuple[str, ...] | set[str] | None,
+) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    raw_items = value if isinstance(value, (list, tuple, set)) else str(value).split(",")
+    items: list[str] = []
+    seen: set[str] = set()
+    for raw_item in raw_items:
+        item = str(raw_item).strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        items.append(item)
+    return tuple(items)
+
+
+def cli_option_was_provided(argv: list[str] | tuple[str, ...] | None, *flags: str) -> bool:
+    if argv is None:
+        return False
+    normalized_flags = tuple((str(flag) for flag in flags))
+    for token in argv:
+        token_s = str(token)
+        if token_s in normalized_flags:
+            return True
+        if any((token_s.startswith(f"{flag}=") for flag in normalized_flags)):
+            return True
+    return False
+
+
+def build_normalized_task_selector(
+    value: str | list[str] | tuple[str, ...] | set[str] | None,
+) -> NormalizedTaskSelector:
+    items = normalize_csv_items(value)
+    canonical = ",".join(items) if items else None
+    return NormalizedTaskSelector(
+        raw=None if value is None else str(value), items=items, canonical=canonical
+    )
+
+
+def infer_robocasa_task_from_selector(selector: str | os.PathLike[str] | None) -> str | None:
+    normalized = normalize_cli_text(selector)
+    if normalized is None:
+        return None
+    parts = [part for part in normalized.split("/") if part not in {"", ".", ".."}]
+    if parts[:2] == ["main", "data"]:
+        parts = parts[2:]
+    elif parts[:1] == ["data"]:
+        parts = parts[1:]
+    if len(parts) < 3 or parts[0] != "robocasa":
+        return None
+    if parts[1] not in ROBOCASA_TASK_COLLECTION_NAMES:
+        return None
+    task_name = str(parts[2]).strip()
+    if not task_name or task_name in ROBOCASA_TASK_COLLECTION_NAMES:
+        return None
+    return task_name
+
+
+def resolve_robocasa_task_selector(args: argparse.Namespace) -> NormalizedTaskSelector:
+    explicit = build_normalized_task_selector(getattr(args, "task", None))
+    if explicit.items:
+        return explicit
+    defaults_tasks = build_normalized_task_selector(
+        getattr(args, "_policy_defaults_dataset_tasks", None)
+    )
+    if defaults_tasks.items:
+        return defaults_tasks
+    for selector in (
+        getattr(args, "dataset", None),
+        getattr(args, "dataset_repo_id", None),
+        getattr(args, "_policy_defaults_dataset_root", None),
+    ):
+        task_name = infer_robocasa_task_from_selector(selector)
+        if task_name is not None:
+            return build_normalized_task_selector(task_name)
+    return explicit
+
+
+def normalize_eval_args(args: argparse.Namespace) -> argparse.Namespace:
+    args.dataset = normalize_cli_text(getattr(args, "dataset", None))
+    args.dataset_repo_id = normalize_cli_text(getattr(args, "dataset_repo_id", None))
+    if args.env == "robocasa":
+        task_selector = resolve_robocasa_task_selector(args)
+    else:
+        task_selector = build_normalized_task_selector(getattr(args, "task", None))
+    args.eval_task_names = task_selector.items
+    args.eval_task_spec = task_selector.canonical
+    args.task = task_selector.canonical
+    args.eval_mode = "env" if args.env is not None else "dataset"
+    args.eval_num_rollouts = int(args.num_rollouts)
+    args.eval_max_steps = None if args.max_steps is None else int(args.max_steps)
+    args.eval_fps = int(args.fps)
+    args.eval_max_episodes_rendered = (
+        None if args.max_episodes_rendered is None else int(args.max_episodes_rendered)
+    )
+    args.eval_seed = None if getattr(args, "seed", None) is None else int(args.seed)
+    args.eval_split_name = str(args.eval_split)
+    args.eval_max_episodes = args.max_episodes
+    args.eval_max_steps_per_episode = args.max_steps_per_episode
+    args.eval_dataset_selector = args.dataset
+    args.eval_robocasa_conda_env = normalize_cli_text(getattr(args, "robocasa_conda_env", None))
+    args.robocasa_conda_env = args.eval_robocasa_conda_env
+    args.eval_robocasa_split = str(getattr(args, "robocasa_split", "target"))
+    args.robocasa_split = args.eval_robocasa_split
+    temporal_ensemble_coeff = getattr(args, "temporal_ensemble_coeff", None)
+    if temporal_ensemble_coeff is not None:
+        temporal_ensemble_coeff = float(temporal_ensemble_coeff)
+        args.temporal_ensemble_coeff = temporal_ensemble_coeff
+    args.eval_temporal_ensemble_coeff = temporal_ensemble_coeff
+    args.gripper_hysteresis_enabled = bool(getattr(args, "gripper_hysteresis_enabled", False))
+    args.gripper_action_indices = parse_int_sequence(
+        getattr(args, "gripper_action_indices", None), key="--gripper-action-indices"
+    )
+    for attr, key in (
+        ("gripper_closed_values", "--gripper-closed-values"),
+        ("gripper_open_values", "--gripper-open-values"),
+        ("gripper_close_thresholds", "--gripper-close-thresholds"),
+        ("gripper_open_thresholds", "--gripper-open-thresholds"),
+    ):
+        setattr(args, attr, parse_float_sequence(getattr(args, attr, None), key=key))
+    args.gripper_hysteresis_ratio = float(getattr(args, "gripper_hysteresis_ratio", 0.25))
+    if not 0.0 <= args.gripper_hysteresis_ratio < 1.0:
+        raise ValueError("--gripper-hysteresis-ratio must be in [0, 1).")
+    return args
+
+
+def validate_policy_n_action_steps(cfg) -> None:
+    n_action_steps = getattr(cfg, "n_action_steps", None)
+    if n_action_steps is None:
+        return
+    cfg.n_action_steps = int(n_action_steps)
+    if cfg.n_action_steps <= 0:
+        raise ValueError(f"`--n-action-steps` must be positive, got {cfg.n_action_steps}.")
+    if hasattr(cfg, "chunk_size") and cfg.n_action_steps > int(cfg.chunk_size):
+        raise ValueError(
+            f"`--n-action-steps` cannot exceed the checkpoint chunk_size. Got n_action_steps={cfg.n_action_steps}, chunk_size={cfg.chunk_size}."
+        )
+    if hasattr(cfg, "horizon") and hasattr(cfg, "n_obs_steps"):
+        max_n_action_steps = int(cfg.horizon) - int(cfg.n_obs_steps) + 1
+        if cfg.n_action_steps > max_n_action_steps:
+            raise ValueError(
+                f"`--n-action-steps` cannot exceed the checkpoint diffusion execution window (`horizon - n_obs_steps + 1`). Got n_action_steps={cfg.n_action_steps}, horizon={cfg.horizon}, n_obs_steps={cfg.n_obs_steps}, max={max_n_action_steps}."
+            )
+
+
+def configure_streaming_act_eval_runtime(
+    *,
+    policy,
+    cfg,
+    requested_n_action_steps: int | None,
+    requested_temporal_ensemble_coeff: float | None,
+    temporal_ensembler_factory=None,
+) -> bool:
+    runtime_reconfigured = False
+    if requested_n_action_steps is not None:
+        cfg.n_action_steps = int(requested_n_action_steps)
+        runtime_reconfigured = True
+    if requested_temporal_ensemble_coeff is not None:
+        coeff = float(requested_temporal_ensemble_coeff)
+        if coeff < 0.0:
+            raise ValueError(f"`--temporal-ensemble-coeff` must be >= 0. Got {coeff}.")
+        runtime_reconfigured = True
+        if coeff == 0.0:
+            if getattr(cfg, "temporal_ensemble_coeff", None) is not None:
+                print(
+                    "[eval] temporal_ensemble_coeff=0 -> disabling temporal ensembling and using the current rollout action queue."
+                )
+            cfg.temporal_ensemble_coeff = None
+        else:
+            if int(getattr(cfg, "n_action_steps", 1)) != 1:
+                print(
+                    "[eval] temporal ensembling enabled -> forcing `n_action_steps=1` for per-step replanning."
+                )
+            cfg.temporal_ensemble_coeff = coeff
+            cfg.n_action_steps = 1
+    effective_temporal_ensemble_coeff = getattr(cfg, "temporal_ensemble_coeff", None)
+    if effective_temporal_ensemble_coeff is not None:
+        if int(getattr(cfg, "n_action_steps", 1)) != 1:
+            print(
+                "[eval] `streaming_act` temporal ensembling requires `n_action_steps=1`; overriding the rollout setting."
+            )
+            cfg.n_action_steps = 1
+            runtime_reconfigured = True
+        if temporal_ensembler_factory is None:
+            ensure_streaming_act_importable(PROJECT_ROOT)
+            from lerobot_policy_streaming_act.modeling_streaming_act import (
+                StreamingACTTemporalEnsembler,
+            )
+
+            temporal_ensembler_factory = StreamingACTTemporalEnsembler
+        policy.temporal_ensembler = temporal_ensembler_factory(
+            float(effective_temporal_ensemble_coeff), int(cfg.chunk_size)
+        )
+        runtime_reconfigured = True
+    validate_policy_n_action_steps(cfg)
+    return runtime_reconfigured
+
+
+def ensure_writable_hf_cache_env(project_root: Path) -> None:
+    cache_root = (project_root / ".cache" / "huggingface").resolve()
     hf_home = cache_root / "home"
     hf_datasets_cache = cache_root / "datasets"
     xdg_cache_home = cache_root / "xdg"
@@ -146,134 +613,144 @@ def ensure_writable_hf_cache_env(repo_root: Path) -> None:
 def default_dataset_output_subdir(dataset_selector: str | None) -> Path | None:
     if not dataset_selector:
         return None
-
     raw = str(dataset_selector).strip().replace("\\", "/")
     if not raw:
         return None
     if raw.startswith("./"):
         raw = raw[2:]
-    for prefix in ("main/data/", "data/"):
+    for prefix in ("data/",):
         if raw.startswith(prefix):
             raw = raw[len(prefix) :]
             break
-    marker = "/main/data/"
-    if marker in raw:
-        raw = raw.split(marker, 1)[1]
-
     parts = [
-        normalize_output_path_part(part)
-        for part in raw.split("/")
-        if part not in {"", ".", ".."}
+        normalize_output_path_part(part) for part in raw.split("/") if part not in {"", ".", ".."}
     ]
     if not parts:
         return None
     return Path(*parts)
 
 
-def default_train_output_root(
-    policy_name: str,
-    dataset_selector: str | None = None,
-) -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    base = repo_root / "main" / "outputs" / "train"
+def default_train_output_root(policy_name: str, dataset_selector: str | None = None) -> Path:
+    base = PROJECT_ROOT / "outputs" / "train"
     dataset_subdir = default_dataset_output_subdir(dataset_selector)
     if dataset_subdir is not None:
         return base / dataset_subdir / default_policy_series_name(policy_name)
     return base / default_policy_series_name(policy_name)
 
 
-def default_eval_output_dir(
-    policy_name: str,
-    dataset_selector: str | None = None,
-) -> str:
-    repo_root = Path(__file__).resolve().parents[2]
-    base = repo_root / "main" / "outputs" / "eval"
+def default_eval_output_dir(policy_name: str, dataset_selector: str | None = None) -> str:
+    base = PROJECT_ROOT / "outputs" / "eval"
     dataset_subdir = default_dataset_output_subdir(dataset_selector)
     if dataset_subdir is not None:
-        return str(
-            base / dataset_subdir / default_policy_series_name(policy_name) / "{run_tag}"
-        )
+        return str(base / dataset_subdir / default_policy_series_name(policy_name) / "{run_tag}")
     return str(base / default_policy_series_name(policy_name) / "{run_tag}")
+
+
+def infer_eval_defaults_dataset_selector(
+    *, env_name: str | None, dataset_selector: str | None, task_selector: str | None
+) -> str | None:
+    normalized_dataset = normalize_cli_text(dataset_selector)
+    task_items = normalize_csv_items(task_selector)
+    single_task = task_items[0] if len(task_items) == 1 else None
+    if normalized_dataset is not None:
+        if (
+            single_task is not None
+            and (
+                env_name == "robocasa"
+                or normalized_dataset == "robocasa"
+                or normalized_dataset.startswith("robocasa/")
+            )
+            and (infer_robocasa_task_from_selector(normalized_dataset) is None)
+        ):
+            return single_task
+        return normalized_dataset
+    if env_name == "robocasa" and single_task is not None:
+        return single_task
+    return None
+
+
+def resolve_direct_dataset_root(dataset: str | Path, *, local_data_root: Path) -> Path | None:
+    dataset_text = str(dataset).strip()
+    normalized_dataset_text = dataset_text.replace("\\", "/")
+    raw_path = Path(dataset_text).expanduser()
+    candidates: list[Path] = []
+    if raw_path.is_absolute() or raw_path.exists() or dataset_text.startswith("."):
+        candidates.append(raw_path)
+    if not raw_path.is_absolute():
+        if normalized_dataset_text.startswith("data/"):
+            candidates.append(local_data_root / normalized_dataset_text[len("data/") :])
+        candidates.append(local_data_root / dataset_text)
+        candidates.append(local_data_root / dataset_text.replace("/", "_"))
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve(strict=False)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if is_supported_lerobot_dataset_root(candidate):
+            return candidate.resolve()
+    return None
 
 
 def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     bootstrap = argparse.ArgumentParser(add_help=False)
     bootstrap.add_argument("--dataset", type=str, default=None)
-    bootstrap.add_argument(
-        "--env",
-        choices=get_env_choices(),
-        default=None,
-    )
-    bootstrap.add_argument(
-        "--policy",
-        choices=["act", "diffusion", "streaming_act"],
-        default="act",
-    )
+    bootstrap.add_argument("--env", choices=get_env_choices(), default=None)
+    bootstrap.add_argument("--policy", choices=POLICY_CHOICES, default="streaming_act")
+    bootstrap.add_argument("--task", type=str, default=None)
+    bootstrap.add_argument("--tasks", dest="task", type=str)
+    bootstrap.add_argument("--cil", dest="task", type=str)
     known_args, _ = bootstrap.parse_known_args(argv)
     defaults = {}
     dataset_train_defaults = {}
     defaults_path = None
-    if known_args.dataset:
+    defaults_dataset_selector = infer_eval_defaults_dataset_selector(
+        env_name=known_args.env,
+        dataset_selector=known_args.dataset,
+        task_selector=getattr(known_args, "task", None),
+    )
+    if defaults_dataset_selector:
         defaults, defaults_path = load_policy_mode_defaults_for_dataset(
-            mode="eval",
-            dataset_selector=known_args.dataset,
-            policy_name=known_args.policy,
+            mode="eval", dataset_selector=defaults_dataset_selector, policy_name=known_args.policy
         )
         dataset_train_defaults, _ = load_policy_mode_defaults_for_dataset(
-            mode="train",
-            dataset_selector=known_args.dataset,
-            policy_name=known_args.policy,
+            mode="train", dataset_selector=defaults_dataset_selector, policy_name=known_args.policy
         )
     if known_args.env:
         try:
             env_defaults = load_policy_mode_defaults(
-                mode="eval",
-                env_name=known_args.env,
-                policy_name=known_args.policy,
+                mode="eval", env_name=known_args.env, policy_name=known_args.policy
             )
         except FileNotFoundError:
             env_defaults = {}
         defaults.update(env_defaults)
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "Evaluate a LeRobot ACT, Diffusion, or Streaming ACT checkpoint "
-            "either with env rollouts (`--env`) or on a held-out dataset split "
-            "(`--dataset`)."
+    gripper_defaults = defaults.get("gripper_hysteresis", {})
+    if gripper_defaults is None:
+        gripper_defaults = {}
+    if not isinstance(gripper_defaults, dict):
+        raise TypeError(
+            f"Expected eval default `gripper_hysteresis` to be a mapping, got {type(gripper_defaults).__name__}."
         )
+    parser = argparse.ArgumentParser(
+        description="Evaluate a full TRACE ACT or TRACE Diffusion checkpoint either with env rollouts (`--env`) or on a held-out dataset split (`--dataset`)."
     )
-    parser.add_argument(
-        "--policy",
-        choices=["act", "diffusion", "streaming_act"],
-        default=known_args.policy,
-    )
+    parser.add_argument("--policy", choices=POLICY_CHOICES, default=known_args.policy)
     parser.add_argument(
         "--env",
         choices=get_env_choices(),
         default=None,
-        help=(
-            "Optional simulator environment for online rollout evaluation. "
-            "If omitted, eval_policy runs offline against a held-out dataset split."
-        ),
+        help="Optional simulator environment for online rollout evaluation. If omitted, eval_policy runs offline against a held-out dataset split.",
     )
     parser.add_argument(
         "--dataset",
         type=str,
         default=known_args.dataset,
-        help=(
-            "Dataset ID or path under main/data. This value is also used to resolve "
-            "`bash/defaults/<dataset_key>/<policy>.yaml` when present. "
-            "If omitted in dataset mode, reuse the dataset recorded in the nearest "
-            "dataset_split.json next to the training run."
-        ),
+        help="Dataset ID or path under data/. This value is also used to resolve `bash/defaults/<dataset_key>/<policy>.yaml` when present. If omitted in dataset mode, reuse the dataset recorded in the nearest dataset_split.json next to the training run.",
     )
     parser.add_argument(
         "--dataset-repo-id",
         type=str,
-        default=defaults.get(
-            "dataset_repo_id",
-            dataset_train_defaults.get("dataset_repo_id"),
-        ),
+        default=defaults.get("dataset_repo_id", dataset_train_defaults.get("dataset_repo_id")),
         help="Optional logical repo_id override used when loading the local LeRobot dataset.",
     )
     parser.add_argument(
@@ -286,10 +763,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         "--policy-path",
         type=Path,
         default=None,
-        help=(
-            "Checkpoint dir, pretrained_model dir, or training run dir. "
-            "If omitted, the latest run under --train-output-root is used."
-        ),
+        help="Checkpoint dir, pretrained_model dir, or training run dir. If omitted, the latest run under --train-output-root is used.",
     )
     parser.add_argument(
         "--latest-run-dir",
@@ -301,8 +775,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         "--train-output-root",
         type=Path,
         default=defaults.get(
-            "train_output_root",
-            default_train_output_root(known_args.policy, known_args.dataset),
+            "train_output_root", default_train_output_root(known_args.policy, known_args.dataset)
         ),
         help="Training output root used to infer the latest run.",
     )
@@ -310,17 +783,13 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         "--run-tag",
         type=str,
         default=None,
-        help=(
-            "Value substituted into --output-dir when it contains '{run_tag}'. "
-            "Defaults to the current timestamp."
-        ),
+        help="Value substituted into --output-dir when it contains '{run_tag}'. Defaults to the current timestamp.",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
         default=defaults.get(
-            "output_dir",
-            default_eval_output_dir(known_args.policy, known_args.dataset),
+            "output_dir", default_eval_output_dir(known_args.policy, known_args.dataset)
         ),
         help="Directory where evaluation artifacts are saved.",
     )
@@ -334,18 +803,69 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         "--n-action-steps",
         type=int,
         default=defaults.get("n_action_steps"),
-        help=(
-            "Optional override for policy n_action_steps during evaluation. "
-            "Set to 1 for per-step replanning. Defaults to the checkpoint config."
-        ),
+        help="Optional override for policy n_action_steps during evaluation. Set to 1 for per-step replanning. Defaults to the checkpoint config.",
+    )
+    if known_args.policy == "streaming_act":
+        parser.add_argument(
+            "--temporal-ensemble-coeff",
+            type=float,
+            default=defaults.get("temporal_ensemble_coeff"),
+            help="Streaming ACT rollout override for temporal action ensembling. Set to 0 to disable and keep the current rollout behavior. Set to a non-zero value to enable temporal ensembling, force `n_action_steps=1`, and execute ensembled actions.",
+        )
+    parser.add_argument(
+        "--device", type=str, default=defaults.get("device", "cuda"), help="cuda/cpu/mps"
+    )
+    gripper_group = parser.add_mutually_exclusive_group()
+    gripper_group.add_argument(
+        "--enable-gripper-hysteresis",
+        dest="gripper_hysteresis_enabled",
+        action="store_true",
+        help="Discretize configured gripper action dimensions with a stateful hysteresis curve after action unnormalization.",
+    )
+    gripper_group.add_argument(
+        "--disable-gripper-hysteresis",
+        dest="gripper_hysteresis_enabled",
+        action="store_false",
+        help="Disable gripper hysteresis even if defaults enable it.",
+    )
+    parser.set_defaults(gripper_hysteresis_enabled=bool(gripper_defaults.get("enabled", False)))
+    parser.add_argument(
+        "--gripper-action-indices",
+        default=gripper_defaults.get("action_indices", gripper_defaults.get("indices")),
+        help="Comma-separated action indices for grippers. If omitted while enabled, the zeno layout default is inferred from action_dim.",
     )
     parser.add_argument(
-        "--device",
-        type=str,
-        default=defaults.get("device", "cuda"),
-        help="cuda/cpu/mps",
+        "--gripper-closed-values",
+        default=gripper_defaults.get("closed_values"),
+        help="Comma-separated discrete closed values. If omitted, dataset action stats min values are used for the selected gripper indices.",
     )
-
+    parser.add_argument(
+        "--gripper-open-values",
+        default=gripper_defaults.get("open_values"),
+        help="Comma-separated discrete open values. If omitted, dataset action stats max values are used for the selected gripper indices.",
+    )
+    parser.add_argument(
+        "--gripper-close-thresholds",
+        default=gripper_defaults.get("close_thresholds"),
+        help="Comma-separated thresholds for switching from open to closed.",
+    )
+    parser.add_argument(
+        "--gripper-open-thresholds",
+        default=gripper_defaults.get("open_thresholds"),
+        help="Comma-separated thresholds for switching from closed to open.",
+    )
+    parser.add_argument(
+        "--gripper-hysteresis-ratio",
+        type=float,
+        default=gripper_defaults.get("hysteresis_ratio", 0.25),
+        help="Fraction of the closed/open span reserved as the keep-state band when explicit thresholds are omitted.",
+    )
+    parser.add_argument(
+        "--gripper-initial-state",
+        choices=["current", "prediction", "closed", "open"],
+        default=str(gripper_defaults.get("initial_state", "current")).lower(),
+        help="How to initialize each gripper latch at the start of an episode. `current` uses observation.state when available.",
+    )
     parser.add_argument(
         "--eval-split",
         type=str,
@@ -357,10 +877,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         "--test-ratio",
         type=float,
         default=defaults.get("test_ratio"),
-        help=(
-            "Optional held-out ratio used when no saved dataset_split.json is found. "
-            "If omitted, dataset mode falls back to the dataset's info.json split metadata."
-        ),
+        help="Optional held-out ratio used when no saved dataset_split.json is found. If omitted, dataset mode falls back to the dataset's info.json split metadata.",
     )
     parser.add_argument(
         "--split-seed",
@@ -394,7 +911,36 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         default=defaults.get("max_steps_per_episode"),
         help="Optional cap on the number of timesteps evaluated per episode in dataset mode.",
     )
-
+    parser.add_argument(
+        "--save-debug-videos",
+        action="store_true",
+        default=bool(defaults.get("save_debug_videos", False)),
+        help="In dataset mode, save deploy-style debug videos for attention, slot memory routing, and path signature distribution panels.",
+    )
+    parser.add_argument(
+        "--debug-video-fps",
+        type=int,
+        default=defaults.get("debug_video_fps", defaults.get("fps", 20)),
+        help="FPS for dataset debug videos saved by --save-debug-videos.",
+    )
+    parser.add_argument(
+        "--debug-video-max-episodes",
+        type=int,
+        default=defaults.get("debug_video_max_episodes"),
+        help="Optional cap on the number of episodes that write debug videos. Metrics are still computed for all selected episodes.",
+    )
+    parser.add_argument(
+        "--debug-attention-query-step",
+        type=int,
+        default=defaults.get("debug_attention_query_step", 0),
+        help="Decoder query step used for saved attention heatmap overlays.",
+    )
+    parser.add_argument(
+        "--debug-overlay-alpha",
+        type=float,
+        default=defaults.get("debug_overlay_alpha", 0.45),
+        help="Heatmap opacity for saved attention debug videos.",
+    )
     parser.add_argument(
         "--num-rollouts",
         type=int,
@@ -408,56 +954,42 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         help="Maximum rollout length in env mode.",
     )
     parser.add_argument(
-        "--fps",
-        type=int,
-        default=defaults.get("fps", 20),
-        help="Video fps in env rollout mode.",
+        "--fps", type=int, default=defaults.get("fps", 20), help="Video fps in env rollout mode."
     )
     parser.add_argument(
         "--task",
         type=str,
         default=defaults.get("task", defaults.get("cil")),
-        help=(
-            "Optional env task spec. For Meta-World, use a comma-separated task list "
-            "such as `assembly-v3,dial-turn-v3,handle-press-side-v3`. For RoboCasa, "
-            "pass one task or a comma-separated task list such as "
-            "`ArrangeBreadBasket,PickPlaceCounterToSink`."
-        ),
+        help="Optional env task spec. For Meta-World, use a comma-separated task list such as `assembly-v3,dial-turn-v3,handle-press-side-v3`. For RoboCasa, pass one task or a comma-separated task list such as `ArrangeBreadBasket,PickPlaceCounterToSink`.",
     )
     parser.add_argument(
         "--tasks",
         dest="task",
         type=str,
         default=argparse.SUPPRESS,
-        help=(
-            "Alias of --task. Useful for RoboCasa multi-task eval, for example "
-            "`--tasks ArrangeBreadBasket,PickPlaceCounterToSink`."
-        ),
+        help="Alias of --task. Useful for RoboCasa multi-task eval, for example `--tasks ArrangeBreadBasket,PickPlaceCounterToSink`.",
     )
     parser.add_argument(
-        "--cil",
-        dest="task",
-        type=str,
-        default=argparse.SUPPRESS,
-        help=argparse.SUPPRESS,
+        "--cil", dest="task", type=str, default=argparse.SUPPRESS, help=argparse.SUPPRESS
     )
     parser.add_argument(
         "--max-episodes-rendered",
         type=int,
         default=defaults.get("max_episodes_rendered"),
-        help=(
-            "Maximum number of rollout videos to save per task in env mode when "
-            "supported by the environment evaluator."
-        ),
+        help="Maximum number of rollout videos to save per task in env mode when supported by the environment evaluator.",
     )
     parser.add_argument(
         "--robocasa-conda-env",
         type=str,
         default=defaults.get("robocasa_conda_env", "robocasa"),
-        help=(
-            "Conda env used to launch RoboCasa when `--env robocasa` is selected. "
-            "Use an empty string only if RoboCasa is importable in the current env."
-        ),
+        help="Conda env used to launch RoboCasa when `--env robocasa` is selected. Use an empty string only if RoboCasa is importable in the current env.",
+    )
+    parser.add_argument(
+        "--robocasa-split",
+        type=str,
+        default=defaults.get("robocasa_split", "target"),
+        choices=["target", "pretrain", "all"],
+        help="RoboCasa task split used by online env eval. `target` is the default benchmark split.",
     )
     parser.add_argument(
         "--success-threshold",
@@ -470,16 +1002,6 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         type=float,
         default=defaults.get("max_action_step", 1.0),
         help="Clamp action magnitude during env rollout evaluation.",
-    )
-    parser.add_argument(
-        "--collision-mode",
-        type=str,
-        default=defaults.get("collision_mode", "reject"),
-        choices=["reject", "detect"],
-        help=(
-            "Only used by braidedhub env evaluation. "
-            "`reject` blocks invalid moves; `detect` records them but allows penetration."
-        ),
     )
     randomize_group = parser.add_mutually_exclusive_group()
     randomize_group.add_argument(
@@ -495,42 +1017,51 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         help="Disable randomized reset start states during env evaluation.",
     )
     parser.set_defaults(enable_randomize=bool(defaults.get("enable_randomize", False)))
-
-    if known_args.policy == "streaming_act":
-        parser.add_argument(
-            "--signature-backend",
-            type=str,
-            default=defaults.get("signature_backend", "auto"),
-            choices=["auto", "signatory", "simple"],
-            help=(
-                "Backend for online path-signature computation during env evaluation "
-                "and for dataset evaluation when the dataset lacks signature features."
-            ),
-        )
+    if policy_supports_signature_features(known_args.policy):
+        pass
     parser.set_defaults(
-        _policy_defaults_path=(
-            None if defaults_path is None else str(defaults_path)
-        ),
+        _policy_defaults_path=None if defaults_path is None else str(defaults_path),
         _policy_defaults_dataset_root=dataset_train_defaults.get("dataset_root"),
+        _policy_defaults_dataset_tasks=dataset_train_defaults.get("dataset_tasks"),
+        _max_steps_default_source="defaults" if "max_steps" in defaults else "builtin",
     )
+    parser.set_defaults(**FULL_TRACE_DEFAULTS)
+    parser.set_defaults(**FULL_TRACE_DEFAULTS)
     return parser
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = build_parser(argv)
-    args = parser.parse_args(argv)
-
+    normalized_argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser(normalized_argv)
+    args = parser.parse_args(normalized_argv)
+    args._cli_provided_max_steps = cli_option_was_provided(normalized_argv, "--max-steps")
+    if (
+        args.env == "robocasa"
+        and (not bool(getattr(args, "_cli_provided_max_steps", False)))
+        and (getattr(args, "_max_steps_default_source", "builtin") == "builtin")
+    ):
+        args.max_steps = None
     output_dir_s = str(args.output_dir)
     if "{run_tag}" in output_dir_s:
         run_tag = args.run_tag or dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir_s = output_dir_s.format(run_tag=run_tag)
     args.output_dir = Path(output_dir_s)
-
     for attr in ("local_data_root", "train_output_root", "policy_path", "latest_run_dir"):
         value = getattr(args, attr)
-        if value is not None and not isinstance(value, Path):
+        if value is not None and (not isinstance(value, Path)):
             setattr(args, attr, Path(value))
-    return args
+    if int(getattr(args, "debug_video_fps", 0)) <= 0:
+        parser.error("--debug-video-fps must be positive.")
+    if (
+        getattr(args, "debug_video_max_episodes", None) is not None
+        and int(args.debug_video_max_episodes) <= 0
+    ):
+        parser.error("--debug-video-max-episodes must be positive when provided.")
+    if int(getattr(args, "debug_attention_query_step", 0)) < 0:
+        parser.error("--debug-attention-query-step must be >= 0.")
+    if not 0.0 <= float(getattr(args, "debug_overlay_alpha", 0.45)) <= 1.0:
+        parser.error("--debug-overlay-alpha must be in [0, 1].")
+    return normalize_eval_args(args)
 
 
 def select_visual_observation_keys(cfg) -> list[str]:
@@ -575,12 +1106,58 @@ def resolve_action_key(cfg) -> str:
     return "action"
 
 
+def resolve_action_dim(cfg, action_key: str) -> int | None:
+    output_features = getattr(cfg, "output_features", None)
+    if not isinstance(output_features, dict):
+        return None
+    feature = output_features.get(action_key)
+    shape = getattr(feature, "shape", None)
+    if shape is None and isinstance(feature, dict):
+        shape = feature.get("shape")
+    if not shape:
+        return None
+    return int(tuple(shape)[0])
+
+
+def build_eval_gripper_hysteresis(
+    *, args, cfg, dataset_root: Path, action_key: str
+) -> GripperHysteresis | None:
+    if not bool(getattr(args, "gripper_hysteresis_enabled", False)):
+        return None
+    raw_config = {
+        "enabled": True,
+        "action_indices": getattr(args, "gripper_action_indices", ()),
+        "closed_values": getattr(args, "gripper_closed_values", ()),
+        "open_values": getattr(args, "gripper_open_values", ()),
+        "close_thresholds": getattr(args, "gripper_close_thresholds", ()),
+        "open_thresholds": getattr(args, "gripper_open_thresholds", ()),
+        "hysteresis_ratio": getattr(args, "gripper_hysteresis_ratio", 0.25),
+        "initial_state": getattr(args, "gripper_initial_state", "current"),
+    }
+    gripper_config = parse_gripper_hysteresis_config(
+        raw_config, action_dim=resolve_action_dim(cfg, action_key)
+    )
+    gripper_config = complete_gripper_hysteresis_config_from_dataset_stats(
+        gripper_config, dataset_root=dataset_root, action_key=action_key
+    )
+    return GripperHysteresis(gripper_config)
+
+
 def as_tensor_copy(value):
     import torch
 
     if torch.is_tensor(value):
         return value.detach().clone()
     return torch.as_tensor(value)
+
+
+def get_optional_dataset_item_value(item, key: str):
+    if key not in item:
+        return None
+    value = item[key]
+    if value is None:
+        return None
+    return value
 
 
 def tensor_to_numpy_vector(value) -> np.ndarray:
@@ -607,65 +1184,90 @@ def build_episode_groups(dataset) -> list[tuple[int, list[int]]]:
 
 
 def compute_online_signature_prefix(
-    state_history: deque[np.ndarray],
-    sig_depth: int,
-    signature_backend: str,
+    state_history: deque[np.ndarray], sig_depth: int, signature_backend: str
 ) -> np.ndarray:
     if len(state_history) == 0:
         raise ValueError("state_history is empty; cannot compute path signature.")
     window = np.stack(list(state_history), axis=0).astype(np.float32, copy=False)
-    if signature_backend == "signatory":
-        return compute_signatory_signature_np(window, sig_depth)
-    return compute_simple_signature_np(window, sig_depth)
+    return compute_signatory_signature_np(window, sig_depth)
 
 
-def resolve_dataset_selection(
+def resolve_dataset_signature_inputs(
     *,
-    args,
-    policy_dir: Path,
-) -> tuple[Path, str, list[int], str]:
-    saved_split_path = find_dataset_split_file(policy_dir)
-    saved_split = (
-        None if saved_split_path is None else load_dataset_split(saved_split_path)
+    item,
+    state_value,
+    state_history: deque[np.ndarray],
+    sig_depth: int,
+    signature_backend: str,
+    previous_signature_vec: np.ndarray | None,
+):
+    import torch
+
+    state_history.append(tensor_to_numpy_vector(state_value))
+    cached_path_signature = get_optional_dataset_item_value(item, DEFAULT_PATH_SIGNATURE_KEY)
+    used_cached_path_signature = cached_path_signature is not None
+    if used_cached_path_signature:
+        path_signature_tensor = as_tensor_copy(cached_path_signature)
+        signature_vec = tensor_to_numpy_vector(cached_path_signature)
+    else:
+        signature_vec = compute_online_signature_prefix(
+            state_history=state_history, sig_depth=sig_depth, signature_backend=signature_backend
+        )
+        path_signature_tensor = torch.from_numpy(signature_vec.astype(np.float32, copy=False))
+    delta_signature_tensor = None
+    used_cached_delta_signature = False
+    cached_delta_signature = get_optional_dataset_item_value(item, DEFAULT_DELTA_SIGNATURE_KEY)
+    used_cached_delta_signature = cached_delta_signature is not None
+    if used_cached_delta_signature:
+        delta_signature_tensor = as_tensor_copy(cached_delta_signature)
+    else:
+        delta_signature_vec = compute_delta_signature_step_np(signature_vec, previous_signature_vec)
+        delta_signature_tensor = torch.from_numpy(
+            delta_signature_vec.astype(np.float32, copy=False)
+        )
+    return (
+        path_signature_tensor,
+        signature_vec,
+        delta_signature_tensor,
+        used_cached_path_signature,
+        used_cached_delta_signature,
     )
 
+
+def resolve_dataset_selection(*, args, policy_dir: Path) -> tuple[Path, str, list[int], str]:
+    saved_split_path = find_dataset_split_file(policy_dir)
+    saved_split = None if saved_split_path is None else load_dataset_split(saved_split_path)
     if args.dataset is not None:
         defaults_dataset_root = getattr(args, "_policy_defaults_dataset_root", None)
-        try:
+        resolved_local_data_root = args.local_data_root.resolve()
+        dataset_root = resolve_direct_dataset_root(
+            args.dataset, local_data_root=resolved_local_data_root
+        )
+        if dataset_root is None and defaults_dataset_root:
             dataset_root = resolve_dataset_root(
-                args.dataset,
-                local_data_root=args.local_data_root.resolve(),
+                defaults_dataset_root, local_data_root=resolved_local_data_root
             )
-        except FileNotFoundError:
-            if not defaults_dataset_root:
-                raise
+        if dataset_root is None:
             dataset_root = resolve_dataset_root(
-                defaults_dataset_root,
-                local_data_root=args.local_data_root.resolve(),
+                args.dataset, local_data_root=resolved_local_data_root
             )
         dataset_repo_id = (
             str(args.dataset_repo_id)
             if args.dataset_repo_id
-            else infer_dataset_repo_id(
-                dataset_root,
-                local_data_root=args.local_data_root.resolve(),
-            )
+            else infer_dataset_repo_id(dataset_root, local_data_root=resolved_local_data_root)
         )
     elif saved_split is not None:
         dataset_root = Path(saved_split.dataset_root).resolve()
         dataset_repo_id = str(saved_split.dataset_repo_id)
     else:
         raise ValueError(
-            "Could not infer the evaluation dataset. Pass --dataset explicitly or "
-            "evaluate a checkpoint inside a training run that contains dataset_split.json."
+            "Could not infer the evaluation dataset. Pass --dataset explicitly or evaluate a checkpoint inside a training run that contains dataset_split.json."
         )
-
     validate_dataset_root(dataset_root)
-
     if (
         saved_split is not None
         and dataset_root.resolve() == Path(saved_split.dataset_root).resolve()
-        and args.test_ratio is None
+        and (args.test_ratio is None)
     ):
         episode_indices = (
             saved_split.train_episode_indices
@@ -678,7 +1280,6 @@ def resolve_dataset_selection(
             [int(ep) for ep in episode_indices],
             f"training_artifact:{saved_split_path}",
         )
-
     if args.test_ratio is not None:
         split_spec = build_dataset_split(
             dataset_arg=args.dataset or dataset_repo_id,
@@ -699,44 +1300,16 @@ def resolve_dataset_selection(
             [int(ep) for ep in episode_indices],
             "cli_ratio_split",
         )
-
     split_name = "train" if args.eval_split == "train" else "test"
     episode_indices = resolve_episode_indices_from_dataset_info(dataset_root, split_name)
     if episode_indices is None:
         raise ValueError(
-            "Could not resolve evaluation episodes from dataset metadata. "
-            "Pass --test-ratio/--split-seed to reconstruct the split or evaluate a "
-            "checkpoint inside a training run that contains dataset_split.json."
+            "Could not resolve evaluation episodes from dataset metadata. Pass --test-ratio/--split-seed to reconstruct the split or evaluate a checkpoint inside a training run that contains dataset_split.json."
         )
-    return dataset_root, dataset_repo_id, [int(ep) for ep in episode_indices], "dataset_info"
+    return (dataset_root, dataset_repo_id, [int(ep) for ep in episode_indices], "dataset_info")
 
 
-def run_env_evaluation(
-    *,
-    args,
-    policy,
-    cfg,
-    preprocessor,
-    postprocessor,
-    policy_dir: Path,
-) -> None:
-    validate_prefix_sequence_support(
-        policy_name=args.policy,
-        use_prefix_sequence_training=bool(
-            getattr(cfg, "use_prefix_sequence_training", False)
-        ),
-    )
-    validate_visual_prefix_memory_support(
-        policy_name=args.policy,
-        use_visual_prefix_memory=bool(
-            getattr(cfg, "use_visual_prefix_memory", False)
-        ),
-    )
-    validate_delta_signature_support(
-        policy_name=args.policy,
-        use_delta_signature=bool(getattr(cfg, "use_delta_signature", False)),
-    )
-
+def run_env_evaluation(*, args, policy, cfg, preprocessor, postprocessor, policy_dir: Path) -> None:
     env_module = get_env_module(args.env)
     env_module.evaluate_policy(
         policy_type=args.policy,
@@ -750,26 +1323,16 @@ def run_env_evaluation(
 
 
 def run_dataset_evaluation(
-    *,
-    args,
-    policy,
-    cfg,
-    preprocessor,
-    postprocessor,
-    policy_dir: Path,
+    *, args, policy, cfg, preprocessor, postprocessor, policy_dir: Path
 ) -> None:
     import torch
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     dataset_root, dataset_repo_id, episode_indices, split_source = resolve_dataset_selection(
-        args=args,
-        policy_dir=policy_dir,
+        args=args, policy_dir=policy_dir
     )
     if not episode_indices:
-        raise ValueError(
-            f"No episodes were resolved for eval_split={args.eval_split!r}."
-        )
-
+        raise ValueError(f"No episodes were resolved for eval_split={args.eval_split!r}.")
     total_resolved_episodes = len(episode_indices)
     selected_episode_indices = [int(ep) for ep in episode_indices]
     if args.max_episodes is not None:
@@ -778,12 +1341,9 @@ def run_dataset_evaluation(
         selected_episode_indices = selected_episode_indices[: args.max_episodes]
     if not selected_episode_indices:
         raise RuntimeError("The selected dataset split produced zero episodes.")
-
     dataset_load_start_s = time.perf_counter()
     print(
-        "[load] Building dataset view: "
-        f"selected_episodes={len(selected_episode_indices)}/{total_resolved_episodes}, "
-        f"dataset_root={dataset_root}"
+        f"[load] Building dataset view: selected_episodes={len(selected_episode_indices)}/{total_resolved_episodes}, dataset_root={dataset_root}"
     )
     dataset = LeRobotDataset(
         repo_id=dataset_repo_id,
@@ -792,76 +1352,60 @@ def run_dataset_evaluation(
         image_transforms=None,
     )
     print(
-        "[timing] Dataset view loaded in "
-        f"{format_elapsed_s(time.perf_counter() - dataset_load_start_s)} "
-        f"({dataset.num_episodes} episodes, {dataset.num_frames} frames)"
+        f"[timing] Dataset view loaded in {format_elapsed_s(time.perf_counter() - dataset_load_start_s)} ({dataset.num_episodes} episodes, {dataset.num_frames} frames)"
     )
     episode_groups = build_episode_groups(dataset)
     if not episode_groups:
         raise RuntimeError("The selected dataset split produced zero decodable episodes.")
-
     print(
-        "Resolved dataset split: "
-        f"source={split_source}, dataset_root={dataset_root}, "
-        f"episodes={len(episode_groups)}/{total_resolved_episodes}"
+        f"Resolved dataset split: source={split_source}, dataset_root={dataset_root}, episodes={len(episode_groups)}/{total_resolved_episodes}"
     )
-
     visual_keys = select_visual_observation_keys(cfg)
     state_key = resolve_state_key(cfg)
     env_state_key = resolve_env_state_key(cfg)
     action_key = resolve_action_key(cfg)
-
-    use_path_signature = bool(
-        args.policy == "streaming_act" and getattr(cfg, "use_path_signature", False)
+    gripper_hysteresis = build_eval_gripper_hysteresis(
+        args=args, cfg=cfg, dataset_root=dataset_root, action_key=action_key
     )
-    use_prefix_sequence_training = bool(
-        args.policy == "streaming_act"
-        and getattr(cfg, "use_prefix_sequence_training", False)
-    )
-    use_visual_prefix_memory = bool(
-        args.policy == "streaming_act"
-        and getattr(cfg, "use_visual_prefix_memory", False)
-    )
-    use_signature_indexed_slot_memory = bool(
-        args.policy == "streaming_act"
-        and getattr(cfg, "use_signature_indexed_slot_memory", False)
-    )
-    use_delta_signature = bool(
-        args.policy == "streaming_act" and getattr(cfg, "use_delta_signature", False)
-    )
-    build_explicit_prefix_eval_inputs = (
-        use_prefix_sequence_training and not use_visual_prefix_memory
-    )
+    if gripper_hysteresis is not None:
+        gripper_info = gripper_hysteresis.describe()
+        print(
+            f"[info] gripper hysteresis enabled: indices={gripper_info['action_indices']}, closed={gripper_info['closed_values']}, open={gripper_info['open_values']}, close_thresholds={gripper_info['close_thresholds']}, open_thresholds={gripper_info['open_thresholds']}, initial_state={gripper_info['initial_state']}"
+        )
+    resolve_policy_capability_flags(cfg)
     signature_backend = None
-    if use_path_signature:
-        signature_backend = resolve_signature_backend(
-            getattr(args, "signature_backend", "auto")
-        )
+    signature_backend = resolve_signature_backend("signatory")
+    print(
+        f"[info] path-signature eval enabled: backend={signature_backend}, depth={cfg.signature_depth}, dim={cfg.signature_dim}"
+    )
+    print(
+        f"[info] delta-signature eval enabled: key={DEFAULT_DELTA_SIGNATURE_KEY}, first_step=zeros"
+    )
+    initial_memory_debug = get_visual_memory_debug_stats(policy)
+    print(
+        "[info] visual prefix memory eval enabled: "
+        + "the policy updates signature-indexed slot memory from the true current observation at each step"
+    )
+    if initial_memory_debug is not None:
         print(
-            "[info] path-signature eval enabled: "
-            f"backend={signature_backend}, depth={cfg.signature_depth}, dim={cfg.signature_dim}"
+            f"[info] visual prefix memory debug: enabled={bool(initial_memory_debug.get('enabled', False))}, num_slots={int(initial_memory_debug.get('num_slots', 0))}, signature_indexed_slot_memory={bool(initial_memory_debug.get('signature_indexed_slot_memory', False))}"
         )
-    if use_delta_signature:
+    output_dir = args.output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_debug_videos = bool(getattr(args, "save_debug_videos", False))
+    debug_videos_dir = output_dir / "debug_videos"
+    debug_video_records: list[dict[str, object]] = []
+    signature_stats = load_feature_stats(dataset_root, DEFAULT_PATH_SIGNATURE_KEY)
+    delta_signature_stats = load_feature_stats(dataset_root, DEFAULT_DELTA_SIGNATURE_KEY)
+    camera_labels = {key: key.rsplit(".", 1)[-1] for key in visual_keys}
+    if save_debug_videos:
         print(
-            "[info] delta-signature eval enabled: "
-            f"key={DEFAULT_DELTA_SIGNATURE_KEY}, first_step=zeros"
+            f"[info] dataset debug video export enabled: dir={debug_videos_dir}, fps={int(args.debug_video_fps)}"
         )
-    if build_explicit_prefix_eval_inputs:
-        print(
-            "[info] explicit prefix-sequence eval enabled: "
-            f"max_steps={cfg.prefix_train_max_steps}, stride={cfg.prefix_frame_stride}, "
-            f"cameras={visual_keys}"
-        )
-    elif use_visual_prefix_memory:
-        print(
-            "[info] visual prefix memory eval enabled: "
-            + (
-                "the policy updates signature-indexed slot memory from the true current observation at each step"
-                if use_signature_indexed_slot_memory
-                else "the policy updates recurrent memory from the true current observation at each step"
+        if True and signature_stats is None:
+            print(
+                "[info] dataset stats do not contain observation.path_signature; signature debug videos will show current signature without a distribution band."
             )
-        )
-
     action_dim: int | None = None
     total_abs_error: np.ndarray | None = None
     total_sq_error: np.ndarray | None = None
@@ -870,218 +1414,224 @@ def run_dataset_evaluation(
     total_cosine_count = 0
     total_steps = 0
     results: list[dict[str, object]] = []
+    per_frame_metrics: list[dict[str, object]] = []
     planned_steps_per_episode: list[int] = []
     for _, rel_indices in episode_groups:
         planned_steps = len(rel_indices)
         if args.max_steps_per_episode is not None:
             if args.max_steps_per_episode <= 0:
-                raise ValueError(
-                    "`--max-steps-per-episode` must be positive when provided."
-                )
+                raise ValueError("`--max-steps-per-episode` must be positive when provided.")
             planned_steps = min(planned_steps, int(args.max_steps_per_episode))
         planned_steps_per_episode.append(planned_steps)
     total_planned_steps = int(sum(planned_steps_per_episode))
-    step_progress = maybe_create_tqdm(
-        total=total_planned_steps,
-        desc="Dataset eval",
-        unit="step",
-    )
+    step_progress = maybe_create_tqdm(total=total_planned_steps, desc="Dataset eval", unit="step")
     print(
-        "[load] Starting dataset evaluation: "
-        f"episodes={len(episode_groups)}, planned_steps={total_planned_steps}"
+        f"[load] Starting dataset evaluation: episodes={len(episode_groups)}, planned_steps={total_planned_steps}"
     )
     textual_progress_step = max(1, total_planned_steps // 20) if total_planned_steps > 0 else 1
-
+    warned_null_path_signature = False
+    warned_null_delta_signature = False
     for episode_pos, ((episode_index, rel_indices), planned_episode_steps) in enumerate(
-        zip(episode_groups, planned_steps_per_episode),
-        start=1,
+        zip(episode_groups, planned_steps_per_episode), start=1
     ):
         if hasattr(policy, "reset"):
             policy.reset()
-
-        state_history = deque() if use_path_signature else None
-        prefix_state_history = [] if build_explicit_prefix_eval_inputs else None
-        prefix_signature_history = (
-            [] if build_explicit_prefix_eval_inputs and use_path_signature else None
-        )
-        prefix_delta_signature_history = (
-            [] if build_explicit_prefix_eval_inputs and use_delta_signature else None
-        )
-        prefix_image_histories = (
-            {key: [] for key in visual_keys}
-            if build_explicit_prefix_eval_inputs
-            else None
-        )
+        if gripper_hysteresis is not None:
+            gripper_hysteresis.reset()
+        state_history = deque()
         previous_signature_vec: np.ndarray | None = None
         episode_abs_error: np.ndarray | None = None
         episode_sq_error: np.ndarray | None = None
         episode_l2_error = 0.0
         episode_cosine = 0.0
         episode_cosine_count = 0
-
+        episode_frame_mae: list[float] = []
+        episode_frame_rmse: list[float] = []
+        episode_frame_l2_error: list[float] = []
+        save_episode_debug = save_debug_videos and (
+            getattr(args, "debug_video_max_episodes", None) is None
+            or len(debug_video_records) < int(args.debug_video_max_episodes)
+        )
+        episode_debug_writers = {}
+        episode_debug_paths: dict[str, str] = {}
+        slot_memory_history: list[dict[str, object]] = []
         evaluated_steps = planned_episode_steps
-
         for rel_idx in rel_indices[:evaluated_steps]:
             item = dataset[rel_idx]
             if state_key not in item:
-                raise KeyError(
-                    f"Dataset item is missing required state key `{state_key}`."
-                )
+                raise KeyError(f"Dataset item is missing required state key `{state_key}`.")
             if env_state_key is not None and env_state_key not in item:
                 raise KeyError(
-                    "Dataset item is missing required environment-state key "
-                    f"`{env_state_key}`."
+                    f"Dataset item is missing required environment-state key `{env_state_key}`."
                 )
             if action_key not in item:
-                raise KeyError(
-                    f"Dataset item is missing required action key `{action_key}`."
-                )
+                raise KeyError(f"Dataset item is missing required action key `{action_key}`.")
             missing_visual_keys = [key for key in visual_keys if key not in item]
             if missing_visual_keys:
                 raise KeyError(
-                    "Dataset item is missing required visual observation keys: "
-                    f"{missing_visual_keys}."
+                    f"Dataset item is missing required visual observation keys: {missing_visual_keys}."
                 )
-
             obs = {state_key: as_tensor_copy(item[state_key])}
             if env_state_key is not None:
                 obs[env_state_key] = as_tensor_copy(item[env_state_key])
+            debug_images = {}
             for visual_key in visual_keys:
                 obs[visual_key] = as_tensor_copy(item[visual_key])
-
+                if save_episode_debug:
+                    debug_images[visual_key] = tensor_image_to_uint8_hwc(item[visual_key])
             signature_vec: np.ndarray | None = None
-            if use_path_signature:
-                assert state_history is not None
-                state_history.append(tensor_to_numpy_vector(item[state_key]))
-                if DEFAULT_PATH_SIGNATURE_KEY in item:
-                    obs[DEFAULT_PATH_SIGNATURE_KEY] = as_tensor_copy(
-                        item[DEFAULT_PATH_SIGNATURE_KEY]
-                    )
-                    signature_vec = tensor_to_numpy_vector(item[DEFAULT_PATH_SIGNATURE_KEY])
-                else:
-                    signature_vec = compute_online_signature_prefix(
-                        state_history=state_history,
-                        sig_depth=int(cfg.signature_depth),
-                        signature_backend=str(signature_backend),
-                    )
-                    obs[DEFAULT_PATH_SIGNATURE_KEY] = torch.from_numpy(
-                        signature_vec.astype(np.float32, copy=False)
-                    )
-                if signature_vec.shape[0] != int(cfg.signature_dim):
-                    raise RuntimeError(
-                        "Signature dimension mismatch during offline evaluation: "
-                        f"got {signature_vec.shape[0]}, expected {cfg.signature_dim}."
-                    )
-
-                if use_delta_signature:
-                    if DEFAULT_DELTA_SIGNATURE_KEY in item:
-                        obs[DEFAULT_DELTA_SIGNATURE_KEY] = as_tensor_copy(
-                            item[DEFAULT_DELTA_SIGNATURE_KEY]
-                        )
-                    else:
-                        delta_signature_vec = compute_delta_signature_step_np(
-                            signature_vec,
-                            previous_signature_vec,
-                        )
-                        obs[DEFAULT_DELTA_SIGNATURE_KEY] = torch.from_numpy(
-                            delta_signature_vec.astype(np.float32, copy=False)
-                        )
-                    previous_signature_vec = signature_vec.astype(np.float32, copy=True)
-
-            if build_explicit_prefix_eval_inputs:
-                assert prefix_state_history is not None
-                assert prefix_image_histories is not None
-                build_prefix_sequence_eval_inputs(
-                    obs=obs,
-                    cfg=cfg,
-                    state_key=state_key,
-                    image_keys=visual_keys,
-                    signature_key=(
-                        DEFAULT_PATH_SIGNATURE_KEY if use_path_signature else None
-                    ),
-                    delta_signature_key=(
-                        DEFAULT_DELTA_SIGNATURE_KEY if use_delta_signature else None
-                    ),
-                    prefix_state_history=prefix_state_history,
-                    prefix_signature_history=prefix_signature_history,
-                    prefix_delta_signature_history=prefix_delta_signature_history,
-                    prefix_image_histories=prefix_image_histories,
+            delta_signature_vec: np.ndarray | None = None
+            assert state_history is not None
+            path_signature_value_present = DEFAULT_PATH_SIGNATURE_KEY in item
+            delta_signature_value_present = DEFAULT_DELTA_SIGNATURE_KEY in item
+            (
+                path_signature_tensor,
+                signature_vec,
+                delta_signature_tensor,
+                used_cached_path_signature,
+                used_cached_delta_signature,
+            ) = resolve_dataset_signature_inputs(
+                item=item,
+                state_value=item[state_key],
+                state_history=state_history,
+                sig_depth=int(cfg.signature_depth),
+                signature_backend=str(signature_backend),
+                previous_signature_vec=previous_signature_vec,
+            )
+            obs[DEFAULT_PATH_SIGNATURE_KEY] = path_signature_tensor
+            if (
+                path_signature_value_present
+                and (not used_cached_path_signature)
+                and (not warned_null_path_signature)
+            ):
+                progress_write(
+                    step_progress,
+                    "[info] dataset path-signature values contain nulls; falling back to online computation for missing steps",
                 )
-
+                warned_null_path_signature = True
+            if signature_vec.shape[0] != int(cfg.signature_dim):
+                raise RuntimeError(
+                    f"Signature dimension mismatch during offline evaluation: got {signature_vec.shape[0]}, expected {cfg.signature_dim}."
+                )
+            assert delta_signature_tensor is not None
+            delta_signature_vec = tensor_to_numpy_vector(delta_signature_tensor)
+            obs[DEFAULT_DELTA_SIGNATURE_KEY] = delta_signature_tensor
+            if (
+                delta_signature_value_present
+                and (not used_cached_delta_signature)
+                and (not warned_null_delta_signature)
+            ):
+                progress_write(
+                    step_progress,
+                    "[info] dataset delta-signature values contain nulls; falling back to online computation for missing steps",
+                )
+                warned_null_delta_signature = True
+            previous_signature_vec = signature_vec.astype(np.float32, copy=True)
             obs = preprocessor(obs)
-            if use_path_signature:
-                if DEFAULT_PATH_SIGNATURE_KEY not in obs:
-                    raise KeyError(
-                        f"`{DEFAULT_PATH_SIGNATURE_KEY}` missing after preprocessor."
-                    )
-                path_signature = obs[DEFAULT_PATH_SIGNATURE_KEY]
-                if path_signature.ndim == 1:
-                    path_signature = path_signature.unsqueeze(0)
-                elif path_signature.ndim != 2:
-                    raise RuntimeError(
-                        f"`{DEFAULT_PATH_SIGNATURE_KEY}` must be 1D/2D after preprocessing, "
-                        f"got shape={tuple(path_signature.shape)}"
-                    )
-                obs[DEFAULT_PATH_SIGNATURE_KEY] = path_signature.to(
-                    device=obs[state_key].device,
-                    dtype=obs[state_key].dtype,
+            if DEFAULT_PATH_SIGNATURE_KEY not in obs:
+                raise KeyError(f"`{DEFAULT_PATH_SIGNATURE_KEY}` missing after preprocessor.")
+            path_signature = obs[DEFAULT_PATH_SIGNATURE_KEY]
+            if path_signature.ndim == 1:
+                path_signature = path_signature.unsqueeze(0)
+            elif path_signature.ndim != 2:
+                raise RuntimeError(
+                    f"`{DEFAULT_PATH_SIGNATURE_KEY}` must be 1D/2D after preprocessing, got shape={tuple(path_signature.shape)}"
                 )
-            if use_delta_signature:
-                if DEFAULT_DELTA_SIGNATURE_KEY not in obs:
-                    raise KeyError(
-                        f"`{DEFAULT_DELTA_SIGNATURE_KEY}` missing after preprocessor."
-                    )
-                delta_signature = obs[DEFAULT_DELTA_SIGNATURE_KEY]
-                if delta_signature.ndim == 1:
-                    delta_signature = delta_signature.unsqueeze(0)
-                elif delta_signature.ndim != 2:
-                    raise RuntimeError(
-                        f"`{DEFAULT_DELTA_SIGNATURE_KEY}` must be 1D/2D after preprocessing, "
-                        f"got shape={tuple(delta_signature.shape)}"
-                    )
-                obs[DEFAULT_DELTA_SIGNATURE_KEY] = delta_signature.to(
-                    device=obs[state_key].device,
-                    dtype=obs[state_key].dtype,
+            obs[DEFAULT_PATH_SIGNATURE_KEY] = path_signature.to(
+                device=obs[state_key].device, dtype=obs[state_key].dtype
+            )
+            if DEFAULT_DELTA_SIGNATURE_KEY not in obs:
+                raise KeyError(f"`{DEFAULT_DELTA_SIGNATURE_KEY}` missing after preprocessor.")
+            delta_signature = obs[DEFAULT_DELTA_SIGNATURE_KEY]
+            if delta_signature.ndim == 1:
+                delta_signature = delta_signature.unsqueeze(0)
+            elif delta_signature.ndim != 2:
+                raise RuntimeError(
+                    f"`{DEFAULT_DELTA_SIGNATURE_KEY}` must be 1D/2D after preprocessing, got shape={tuple(delta_signature.shape)}"
                 )
-            if build_explicit_prefix_eval_inputs:
-                ensure_prefix_sequence_batch_dims(
-                    obs=obs,
-                    state_key=state_key,
-                    image_keys=visual_keys,
-                    use_path_signature=use_path_signature,
-                    use_delta_signature=use_delta_signature,
-                )
-
+            obs[DEFAULT_DELTA_SIGNATURE_KEY] = delta_signature.to(
+                device=obs[state_key].device, dtype=obs[state_key].dtype
+            )
             with torch.no_grad():
                 predicted_action = policy.select_action(obs)
+                deploy_debug = (
+                    get_policy_deploy_debug_snapshot(policy) if save_episode_debug else None
+                )
             predicted_action = postprocessor(predicted_action)
             predicted_np = tensor_to_numpy_vector(predicted_action.squeeze(0))
             ground_truth_np = tensor_to_numpy_vector(item[action_key])
-
+            if gripper_hysteresis is not None:
+                predicted_np = gripper_hysteresis.apply(
+                    predicted_np, current_state=tensor_to_numpy_vector(item[state_key])
+                )
+            if save_episode_debug:
+                slot_memory_history.append(make_slot_memory_history_sample(deploy_debug))
+                signature_debug = make_signature_debug_payload(
+                    signature_vec=signature_vec,
+                    delta_signature_vec=delta_signature_vec,
+                    signature_stats=signature_stats,
+                    delta_signature_stats=delta_signature_stats,
+                    signature_backend=signature_backend,
+                    history_length=int(getattr(cfg, "history_length", 0) or 0) or None,
+                    window_length=0 if state_history is None else len(state_history),
+                    dataset_root=dataset_root,
+                )
+                debug_panels = {
+                    "attention": render_attention_panel(
+                        images=debug_images,
+                        debug=deploy_debug,
+                        color_order="rgb",
+                        camera_labels=camera_labels,
+                        overlay_alpha=float(args.debug_overlay_alpha),
+                        query_step=int(args.debug_attention_query_step),
+                    ),
+                    "slot_memory": render_slot_memory_panel(
+                        debug=deploy_debug,
+                        images=debug_images,
+                        color_order="rgb",
+                        camera_labels=camera_labels,
+                        history=slot_memory_history,
+                        current_step=len(slot_memory_history) - 1,
+                        total_steps=evaluated_steps,
+                    ),
+                    "signature": render_signature_panel(signature_debug=signature_debug),
+                }
+                for debug_name, panel in debug_panels.items():
+                    if debug_name not in episode_debug_writers:
+                        video_path = (
+                            debug_videos_dir / f"episode_{int(episode_index):06d}_{debug_name}.mp4"
+                        )
+                        writer = start_ffmpeg_rgb_writer(
+                            video_path,
+                            width=int(panel.shape[1]),
+                            height=int(panel.shape[0]),
+                            fps=int(args.debug_video_fps),
+                        )
+                        if writer.stdin is None:
+                            raise RuntimeError(f"Failed to open ffmpeg stdin for {video_path}")
+                        episode_debug_writers[debug_name] = (writer, video_path)
+                        episode_debug_paths[debug_name] = str(video_path)
+                    writer, _ = episode_debug_writers[debug_name]
+                    write_bgr_frame_to_ffmpeg(writer, panel)
             if action_dim is None:
                 action_dim = int(ground_truth_np.shape[0])
                 total_abs_error = np.zeros((action_dim,), dtype=np.float64)
                 total_sq_error = np.zeros((action_dim,), dtype=np.float64)
             if predicted_np.shape[0] != action_dim or ground_truth_np.shape[0] != action_dim:
                 raise RuntimeError(
-                    "Action dimension mismatch during offline evaluation. "
-                    f"predicted={predicted_np.shape[0]}, ground_truth={ground_truth_np.shape[0]}, "
-                    f"expected={action_dim}."
+                    f"Action dimension mismatch during offline evaluation. predicted={predicted_np.shape[0]}, ground_truth={ground_truth_np.shape[0]}, expected={action_dim}."
                 )
-
             error = predicted_np - ground_truth_np
             abs_error = np.abs(error).astype(np.float32, copy=False)
             sq_error = np.square(error).astype(np.float32, copy=False)
             l2_error = float(np.linalg.norm(error))
-
+            frame_mae = float(abs_error.mean())
+            frame_rmse = float(np.sqrt(sq_error.mean()))
             pred_norm = float(np.linalg.norm(predicted_np))
             gt_norm = float(np.linalg.norm(ground_truth_np))
             cosine = None
-            if pred_norm > 1e-8 and gt_norm > 1e-8:
-                cosine = float(
-                    np.dot(predicted_np, ground_truth_np) / (pred_norm * gt_norm)
-                )
-
+            if pred_norm > 1e-08 and gt_norm > 1e-08:
+                cosine = float(np.dot(predicted_np, ground_truth_np) / (pred_norm * gt_norm))
             total_abs_error += abs_error
             total_sq_error += sq_error
             total_l2_error += l2_error
@@ -1094,17 +1644,14 @@ def run_dataset_evaluation(
             elif (
                 total_steps == 1
                 or total_steps == total_planned_steps
-                or (total_steps % textual_progress_step) == 0
+                or total_steps % textual_progress_step == 0
             ):
                 print(
-                    "[Dataset eval] "
-                    f"steps={total_steps}/{total_planned_steps} "
-                    f"episode={episode_pos}/{len(episode_groups)} id={episode_index}"
+                    f"[Dataset eval] steps={total_steps}/{total_planned_steps} episode={episode_pos}/{len(episode_groups)} id={episode_index}"
                 )
             if cosine is not None:
                 total_cosine += cosine
                 total_cosine_count += 1
-
             if episode_abs_error is None:
                 episode_abs_error = np.zeros((action_dim,), dtype=np.float64)
                 episode_sq_error = np.zeros((action_dim,), dtype=np.float64)
@@ -1114,7 +1661,19 @@ def run_dataset_evaluation(
             if cosine is not None:
                 episode_cosine += cosine
                 episode_cosine_count += 1
-
+            episode_frame_mae.append(frame_mae)
+            episode_frame_rmse.append(frame_rmse)
+            episode_frame_l2_error.append(l2_error)
+        for writer, video_path in episode_debug_writers.values():
+            close_ffmpeg_writer(writer, output_path=video_path)
+        if episode_debug_paths:
+            debug_video_records.append(
+                {
+                    "episode_index": int(episode_index),
+                    "steps": int(evaluated_steps),
+                    "videos": dict(sorted(episode_debug_paths.items())),
+                }
+            )
         assert action_dim is not None
         assert episode_abs_error is not None
         assert episode_sq_error is not None
@@ -1122,41 +1681,51 @@ def run_dataset_evaluation(
             "episode_index": int(episode_index),
             "steps": int(evaluated_steps),
             "mae": float(episode_abs_error.sum() / (evaluated_steps * action_dim)),
-            "rmse": float(
-                np.sqrt(episode_sq_error.sum() / (evaluated_steps * action_dim))
-            ),
+            "rmse": float(np.sqrt(episode_sq_error.sum() / (evaluated_steps * action_dim))),
             "mean_l2_error": float(episode_l2_error / evaluated_steps),
-            "cosine_similarity": (
-                None
-                if episode_cosine_count == 0
-                else float(episode_cosine / episode_cosine_count)
-            ),
+            "cosine_similarity": None
+            if episode_cosine_count == 0
+            else float(episode_cosine / episode_cosine_count),
             "per_dim_mae": (episode_abs_error / evaluated_steps).tolist(),
             "per_dim_rmse": np.sqrt(episode_sq_error / evaluated_steps).tolist(),
         }
+        memory_debug_stats = get_visual_memory_debug_stats(policy)
+        if memory_debug_stats is not None:
+            result["visual_memory_debug"] = memory_debug_stats
         results.append(result)
-        cosine_text = (
-            "n/a"
-            if result["cosine_similarity"] is None
-            else f"{result['cosine_similarity']:.4f}"
+        per_frame_metrics.append(
+            {
+                "episode_index": int(episode_index),
+                "steps": int(evaluated_steps),
+                "frame_mae": episode_frame_mae,
+                "frame_rmse": episode_frame_rmse,
+                "frame_l2_error": episode_frame_l2_error,
+            }
         )
+        cosine_text = (
+            "n/a" if result["cosine_similarity"] is None else f"{result['cosine_similarity']:.4f}"
+        )
+        memory_debug_text = ""
+        if memory_debug_stats is not None:
+            memory_debug_text = f" memory_updates={int(memory_debug_stats.get('update_count', 0))} memory_norm={float(memory_debug_stats.get('state_norm', 0.0)):.4f}"
         progress_write(
             step_progress,
-            f"[{episode_pos:03d}/{len(episode_groups):03d}] "
-            f"episode={episode_index} steps={evaluated_steps} "
-            f"mae={result['mae']:.6f} rmse={result['rmse']:.6f} "
-            f"l2={result['mean_l2_error']:.6f} cosine={cosine_text}"
+            f"[{episode_pos:03d}/{len(episode_groups):03d}] episode={episode_index} steps={evaluated_steps} mae={result['mae']:.6f} rmse={result['rmse']:.6f} l2={result['mean_l2_error']:.6f} cosine={cosine_text}{memory_debug_text}",
         )
-
     if step_progress is not None:
         step_progress.close()
-
     assert action_dim is not None
     assert total_abs_error is not None
     assert total_sq_error is not None
-
-    output_dir = args.output_dir.resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    per_frame_metrics_path = write_per_frame_metrics_json(output_dir, per_frame_metrics)
+    per_frame_mae_plot_path = maybe_write_per_frame_mae_plot(output_dir, per_frame_metrics)
+    debug_video_manifest_path = None
+    if debug_video_records:
+        debug_video_manifest_path = output_dir / "debug_videos.json"
+        debug_video_manifest_path.write_text(
+            json.dumps({"episodes": debug_video_records}, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
     summary = {
         "policy_type": args.policy,
         "policy_dir": str(policy_dir),
@@ -1171,158 +1740,133 @@ def run_dataset_evaluation(
             "mae": float(total_abs_error.sum() / (total_steps * action_dim)),
             "rmse": float(np.sqrt(total_sq_error.sum() / (total_steps * action_dim))),
             "mean_l2_error": float(total_l2_error / total_steps),
-            "cosine_similarity": (
-                None
-                if total_cosine_count == 0
-                else float(total_cosine / total_cosine_count)
-            ),
+            "cosine_similarity": None
+            if total_cosine_count == 0
+            else float(total_cosine / total_cosine_count),
             "per_dim_mae": (total_abs_error / total_steps).tolist(),
             "per_dim_rmse": np.sqrt(total_sq_error / total_steps).tolist(),
         },
         "results": results,
+        "artifacts": {
+            "per_frame_metrics_json": str(per_frame_metrics_path),
+            "per_frame_mae_plot": None
+            if per_frame_mae_plot_path is None
+            else str(per_frame_mae_plot_path),
+            "debug_videos_dir": str(debug_videos_dir) if debug_video_records else None,
+            "debug_video_manifest": None
+            if debug_video_manifest_path is None
+            else str(debug_video_manifest_path),
+        },
     }
+    if gripper_hysteresis is not None:
+        summary["gripper_hysteresis"] = gripper_hysteresis.describe()
+    memory_debug_stats = get_visual_memory_debug_stats(policy)
+    if memory_debug_stats is not None:
+        summary["visual_memory_debug"] = memory_debug_stats
     summary_path = write_summary(output_dir, summary)
-
     print(f"\nSummary: {summary_path}")
+    print(f"Per-frame metrics: {per_frame_metrics_path}")
+    if per_frame_mae_plot_path is not None:
+        print(f"Per-frame MAE plot: {per_frame_mae_plot_path}")
+    else:
+        print("[info] matplotlib unavailable; skipped per-frame MAE plot.")
+    if debug_video_manifest_path is not None:
+        print(f"Debug videos: {debug_videos_dir}")
+        print(f"Debug video manifest: {debug_video_manifest_path}")
     print(
-        f"MAE: {summary['metrics']['mae']:.6f}, "
-        f"RMSE: {summary['metrics']['rmse']:.6f}, "
-        f"mean_L2: {summary['metrics']['mean_l2_error']:.6f}"
+        f"MAE: {summary['metrics']['mae']:.6f}, RMSE: {summary['metrics']['rmse']:.6f}, mean_L2: {summary['metrics']['mean_l2_error']:.6f}"
     )
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-
     import torch
 
-    repo_root = Path(__file__).resolve().parents[2]
-    ensure_writable_hf_cache_env(repo_root)
+    ensure_writable_hf_cache_env(PROJECT_ROOT)
     if args.policy == "streaming_act":
-        ensure_streaming_act_importable(repo_root)
-
-    try:
-        from lerobot.configs.policies import PreTrainedConfig
-        from lerobot.policies.factory import make_pre_post_processors
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "Missing LeRobot evaluation dependencies. Install the pip package first, "
-            "for example `pip install lerobot`, and ensure torch is installed for "
-            "your platform."
-        ) from exc
-
-    if args.policy == "streaming_act":
-        from lerobot_policy_streaming_act.configuration_streaming_act import (
-            StreamingACTConfig,
-        )
-        from lerobot_policy_streaming_act.modeling_streaming_act import (
-            StreamingACTPolicy,
-        )
-
-        policy_cls = StreamingACTPolicy
-    elif args.policy == "diffusion":
-        from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
-
-        policy_cls = DiffusionPolicy
+        ensure_streaming_act_importable(PROJECT_ROOT)
     else:
-        from lerobot.policies.act.configuration_act import ACTConfig
-        from lerobot.policies.act.modeling_act import ACTPolicy
+        ensure_prism_diffusion_importable(PROJECT_ROOT)
+        ensure_streaming_act_importable(PROJECT_ROOT)
+    ensure_lerobot_policy_imports(args.policy)
+    if args.policy == "streaming_act":
+        policy_config_cls = None
+        policy_cls = import_local_streaming_act_policy_class(repo_root=PROJECT_ROOT)
+    else:
+        from lerobot_policy_prism_diffusion.configuration_diffusion import PrismDiffusionConfig
+        from lerobot_policy_prism_diffusion.modeling_diffusion import PrismDiffusionPolicy
 
-        policy_cls = ACTPolicy
-
+        policy_cls = PrismDiffusionPolicy
+        policy_config_cls = PrismDiffusionConfig
     policy_dir = resolve_eval_policy_path(
         policy_path=args.policy_path,
         latest_run_dir=args.latest_run_dir,
         train_output_root=args.train_output_root,
     )
     print(f"Using policy path: {policy_dir}")
-
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-
     local_files_only = policy_dir.is_dir()
     config_load_start_s = time.perf_counter()
     print(f"[load] Loading policy config for device={args.device}...")
-    cfg = PreTrainedConfig.from_pretrained(
-        policy_dir,
-        local_files_only=local_files_only,
-    )
+    if args.policy == "streaming_act":
+        cfg = load_streaming_act_config_from_pretrained_dir(policy_dir, repo_root=PROJECT_ROOT)
+    else:
+        cfg = load_pretrained_config_from_pretrained_dir(
+            policy_config_cls, policy_dir, policy_label="TRACE Diffusion"
+        )
     checkpoint_device = getattr(cfg, "device", None)
     if checkpoint_device != args.device:
-        print(
-            "[load] Overriding checkpoint device: "
-            f"{checkpoint_device!r} -> {args.device!r}"
-        )
+        print(f"[load] Overriding checkpoint device: {checkpoint_device!r} -> {args.device!r}")
     cfg.device = args.device
     print(
-        "[timing] Policy config loaded in "
-        f"{format_elapsed_s(time.perf_counter() - config_load_start_s)}"
+        f"[timing] Policy config loaded in {format_elapsed_s(time.perf_counter() - config_load_start_s)}"
     )
-
     policy_load_start_s = time.perf_counter()
     print("[load] Loading policy weights...")
-    policy = policy_cls.from_pretrained(
-        policy_dir,
-        config=cfg,
-        local_files_only=local_files_only,
-    )
+    with quiet_transformers_loading():
+        policy = policy_cls.from_pretrained(
+            policy_dir, config=cfg, local_files_only=local_files_only
+        )
     print(
-        "[timing] Policy weights loaded in "
-        f"{format_elapsed_s(time.perf_counter() - policy_load_start_s)}"
+        f"[timing] Policy weights loaded in {format_elapsed_s(time.perf_counter() - policy_load_start_s)}"
     )
     cfg = policy.config
     cfg.device = args.device
-    if args.n_action_steps is not None:
-        cfg.n_action_steps = int(args.n_action_steps)
-        if cfg.n_action_steps <= 0:
-            raise ValueError(
-                f"`--n-action-steps` must be positive, got {cfg.n_action_steps}."
-            )
-        if hasattr(cfg, "chunk_size") and cfg.n_action_steps > int(cfg.chunk_size):
-            raise ValueError(
-                "`--n-action-steps` cannot exceed the checkpoint chunk_size. "
-                f"Got n_action_steps={cfg.n_action_steps}, chunk_size={cfg.chunk_size}."
-            )
-        if hasattr(cfg, "horizon") and hasattr(cfg, "n_obs_steps"):
-            max_n_action_steps = int(cfg.horizon) - int(cfg.n_obs_steps) + 1
-            if cfg.n_action_steps > max_n_action_steps:
-                raise ValueError(
-                    "`--n-action-steps` cannot exceed the checkpoint diffusion "
-                    "execution window (`horizon - n_obs_steps + 1`). "
-                    f"Got n_action_steps={cfg.n_action_steps}, horizon={cfg.horizon}, "
-                    f"n_obs_steps={cfg.n_obs_steps}, max={max_n_action_steps}."
-                )
+    runtime_reconfigured = False
+    if args.policy == "streaming_act":
+        runtime_reconfigured = configure_streaming_act_eval_runtime(
+            policy=policy,
+            cfg=cfg,
+            requested_n_action_steps=args.n_action_steps,
+            requested_temporal_ensemble_coeff=getattr(args, "eval_temporal_ensemble_coeff", None),
+        )
+    else:
+        if args.n_action_steps is not None:
+            cfg.n_action_steps = int(args.n_action_steps)
+            runtime_reconfigured = True
+        validate_policy_n_action_steps(cfg)
     if (
-        args.policy == "streaming_act"
-        and getattr(cfg, "use_visual_prefix_memory", False)
-        and cfg.n_action_steps > 1
+        hasattr(policy, "get_visual_prefix_memory_debug_stats")
+        and True
+        and (cfg.n_action_steps > 1)
     ):
         print(
-            "[warn] `streaming_act` is evaluating with `n_action_steps>1`. "
-            "Online visual prefix memory is updated every observation step, but new "
-            "memory state does not affect actions already queued for execution. "
-            "For the most responsive streaming evaluation, prefer `--n-action-steps 1`."
+            "[warn] `streaming_act` is evaluating with `n_action_steps>1`. Online visual prefix memory is updated every observation step, but new memory state does not affect actions already queued for execution. For the most responsive streaming evaluation, prefer `--n-action-steps 1`."
+        )
+    if bool(getattr(args, "save_debug_videos", False)) and cfg.n_action_steps > 1:
+        print(
+            "[warn] dataset debug attention videos are refreshed only when a new action chunk is planned. Use `--n-action-steps 1` if you want per-frame attention overlays during dataset validation."
         )
     policy.eval()
-    if args.n_action_steps is not None and hasattr(policy, "reset"):
+    if runtime_reconfigured and hasattr(policy, "reset"):
         policy.reset()
-
-    preprocessor_overrides = {
-        "device_processor": {"device": args.device},
-        "rename_observations_processor": {"rename_map": {}},
-    }
     processor_load_start_s = time.perf_counter()
     print("[load] Initializing pre/post processors...")
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=cfg,
-        pretrained_path=policy_dir,
-        preprocessor_overrides=preprocessor_overrides,
-    )
+    preprocessor, postprocessor = make_standard_pre_post_processors(cfg)
     print(
-        "[timing] Pre/post processors initialized in "
-        f"{format_elapsed_s(time.perf_counter() - processor_load_start_s)}"
+        f"[timing] Pre/post processors initialized in {format_elapsed_s(time.perf_counter() - processor_load_start_s)}"
     )
-
     if args.env is not None:
         run_env_evaluation(
             args=args,
@@ -1333,7 +1877,6 @@ def main(argv: list[str] | None = None) -> None:
             policy_dir=policy_dir,
         )
         return
-
     run_dataset_evaluation(
         args=args,
         policy=policy,

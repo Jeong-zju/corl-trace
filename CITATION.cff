@@ -1,0 +1,34 @@
+cff-version: 1.2.0
+message: "If you use TRACE in your research, please cite the paper below."
+type: software
+title: "TRACE: Trajectory-Routed Causal Memory for Delayed-Evidence Visuomotor Imitation"
+authors:
+  - family-names: Li
+    given-names: Zihao
+  - family-names: Qiu
+    given-names: Ranpeng
+  - family-names: Chen
+    given-names: Yincong
+  - family-names: Ren
+    given-names: Guoqiang
+  - family-names: Zhi
+    given-names: Weiming
+license: Apache-2.0
+url: "https://jeong-zju.github.io/trace/"
+preferred-citation:
+  type: conference-paper
+  title: "TRACE: Trajectory-Routed Causal Memory for Delayed-Evidence Visuomotor Imitation"
+  authors:
+    - family-names: Li
+      given-names: Zihao
+    - family-names: Qiu
+      given-names: Ranpeng
+    - family-names: Chen
+      given-names: Yincong
+    - family-names: Ren
+      given-names: Guoqiang
+    - family-names: Zhi
+      given-names: Weiming
+  collection-title: "Conference on Robot Learning (CoRL)"
+  year: 2026
+  url: "https://jeong-zju.github.io/trace/"
